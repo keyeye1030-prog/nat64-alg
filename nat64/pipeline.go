@@ -23,6 +23,7 @@ const (
 type Translator struct {
 	SessionTable *SessionTable
 	PoolIPv4     net.IP // NAT64 网关的 IPv4 出口地址
+	ALG          *ALGHandler // SIP/H.323 应用层网关
 }
 
 // NewTranslator 创建 NAT64 翻译器实例
@@ -30,6 +31,7 @@ func NewTranslator(poolIPv4 net.IP, table *SessionTable) *Translator {
 	return &Translator{
 		SessionTable: table,
 		PoolIPv4:     poolIPv4.To4(),
+		ALG:          NewALGHandler(poolIPv4),
 	}
 }
 
@@ -118,13 +120,18 @@ func (t *Translator) process6to4(dstMAC, srcMAC, ipv6Raw []byte) *ProcessResult 
 		// ICMP 特殊处理: 需要做类型/代码转换
 		resultPayload, err = t.translateICMPv6Packet(ipv6Raw, sess)
 	} else {
-		// TCP/UDP: 只做 IP 头转换 + 端口 NAT
+		// TCP/UDP: IP 头转换 + 端口 NAT
 		resultPayload, err = TranslateIPv6ToIPv4(ipv6Raw, t.PoolIPv4, dstIPv4)
 		if err == nil {
 			// 写入 NAT 映射后的源端口
 			patchSrcPort(resultPayload[IPv4HeaderMinLen:], sess.Key4.SrcPort)
 			// 重算传输层校验和 (端口变了)
 			recalcTransportChecksum4(resultPayload, resultPayload[9])
+
+			// ALG 处理: 如果是 SIP/H.323 端口, 修改应用层载荷
+			if NeedsALG(srcPort, dstPort) {
+				resultPayload, _ = t.ALG.ProcessALG6to4(resultPayload, sess)
+			}
 		}
 	}
 
@@ -188,6 +195,11 @@ func (t *Translator) process4to6(dstMAC, srcMAC, ipv4Raw []byte) *ProcessResult 
 			// 恢复原始目的端口
 			patchDstPort(resultPayload[IPv6HeaderLen:], sess.Key6.SrcPort)
 			recalcTransportChecksum6(resultPayload, resultPayload[6])
+
+			// ALG 处理: 如果是 SIP/H.323 端口, 修改应用层载荷
+			if NeedsALG(srcPort, dstPort) {
+				resultPayload, _ = t.ALG.ProcessALG4to6(resultPayload, sess)
+			}
 		}
 	}
 
