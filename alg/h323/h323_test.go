@@ -1,264 +1,165 @@
 package h323
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net"
 	"testing"
 )
 
-// ============================================================================
-// H.323 ALG 单元测试
-// ============================================================================
-
 func TestParseTPKT(t *testing.T) {
-	// 构造合法 TPKT
-	data := make([]byte, 20)
-	data[0] = TPKTVersion // Version=3
-	data[1] = 0           // Reserved
-	binary.BigEndian.PutUint16(data[2:4], 20) // Length=20
-	// 填充一些 Q.931 模拟数据
-	data[4] = Q931ProtoDisc // Protocol Discriminator
-
+	data := []byte{0x03, 0x00, 0x00, 0x07, 0x01, 0x02, 0x03}
 	tpkt, err := ParseTPKT(data)
 	if err != nil {
-		t.Fatalf("ParseTPKT error: %v", err)
+		t.Fatalf("ParseTPKT failed: %v", err)
 	}
-
-	if tpkt.Version != 3 {
-		t.Errorf("Version = %d, want 3", tpkt.Version)
+	if tpkt.Version != 3 || tpkt.Length != 7 || !bytes.Equal(tpkt.Payload, []byte{0x01, 0x02, 0x03}) {
+		t.Errorf("TPKT field mismatch: %+v", tpkt)
 	}
-	if tpkt.Length != 20 {
-		t.Errorf("Length = %d, want 20", tpkt.Length)
-	}
-	if len(tpkt.Payload) != 16 {
-		t.Errorf("Payload len = %d, want 16", len(tpkt.Payload))
-	}
-
-	t.Logf("✅ TPKT 解析成功")
+	t.Log("✅ TPKT 解析成功")
 }
 
 func TestParseTPKT_Invalid(t *testing.T) {
-	// 版本号错误
-	data := []byte{0x04, 0x00, 0x00, 0x10}
-	_, err := ParseTPKT(data)
-	if err == nil {
-		t.Errorf("应该返回版本号错误")
+	// 版本错误
+	data := []byte{0x04, 0x00, 0x00, 0x07}
+	if _, err := ParseTPKT(data); err == nil {
+		t.Error("应该报错: 版本不支持")
 	}
 
-	// 太短
-	_, err = ParseTPKT([]byte{0x03})
-	if err == nil {
-		t.Errorf("应该返回数据过短")
+	// 长度不足
+	data = []byte{0x03, 0x00, 0x00}
+	if _, err := ParseTPKT(data); err == nil {
+		t.Error("应该报错: 数据过短")
 	}
 }
 
 func TestSerializeTPKT(t *testing.T) {
-	payload := []byte{0x08, 0x02, 0x00, 0x01, 0x05}
+	payload := []byte{0x05, 0x06, 0x07, 0x08, 0x09}
 	frame := SerializeTPKT(payload)
-
-	if frame[0] != TPKTVersion {
-		t.Errorf("Version = %d", frame[0])
+	if len(frame) != len(payload)+4 {
+		t.Errorf("长度错误: %d", len(frame))
 	}
-	expectedLen := uint16(TPKTHeaderLen + len(payload))
-	gotLen := binary.BigEndian.Uint16(frame[2:4])
-	if gotLen != expectedLen {
-		t.Errorf("Length = %d, want %d", gotLen, expectedLen)
+	if frame[0] != 3 || binary.BigEndian.Uint16(frame[2:4]) != 9 {
+		t.Errorf("Header 错误: %v", frame[:4])
 	}
-
 	t.Logf("✅ TPKT 序列化成功, 总长=%d", len(frame))
 }
 
-func TestScanTransportAddresses_IPv6(t *testing.T) {
-	// 构造模拟的 H.225 数据, 嵌入一个 IPv6 TransportAddress
-	ipv6 := net.ParseIP("2001:db8::1").To16()
-	port := uint16(1720)
+func TestScanTransportAddress(t *testing.T) {
+	data := make([]byte, 100)
+	// 埋入一个 IPv6 地址 [2001:db8::1]:1720
+	// 2001:db8::1 = 20 01 0d b8 00 00 00 00 00 00 00 00 00 00 00 01
+	ipv6 := net.ParseIP("2001:db8::1")
+	copy(data[20:36], ipv6)
+	binary.BigEndian.PutUint16(data[36:38], 1720)
 
-	data := make([]byte, 30)
-	// 前几个字节是随机 ASN.1 结构填充
-	data[0] = 0x28
-	data[1] = 0x06
-	data[2] = 0x00
-	// 在 offset 3 处嵌入 IPv6 TransportAddress
-	copy(data[3:19], ipv6)
-	binary.BigEndian.PutUint16(data[19:21], port)
-
-	addrs := ScanTransportAddresses(data)
-
-	found := false
-	for _, addr := range addrs {
-		if addr.IsIPv6 && addr.IP.Equal(ipv6) && addr.Port == port {
-			found = true
-			t.Logf("  发现 IPv6 TransportAddress @ offset %d: %s:%d", addr.Offset, addr.IP, addr.Port)
-		}
-	}
-
-	if !found {
-		t.Errorf("未能在模拟数据中发现 IPv6 TransportAddress")
-	}
-
-	t.Logf("✅ IPv6 TransportAddress 扫描成功, 发现 %d 个候选", len(addrs))
-}
-
-func TestScanTransportAddresses_IPv4(t *testing.T) {
-	ipv4 := net.ParseIP("198.51.100.1").To4()
-	port := uint16(1720)
-
-	// 填充: 使用 0xFF 开头 (>= 224 会被 isPlausibleIPv4 拒绝)
-	data := make([]byte, 14)
-	data[0] = 0xFF
-	data[1] = 0xFF
-	data[2] = 0xFF
-	data[3] = 0xFF
-	copy(data[4:8], ipv4)
-	binary.BigEndian.PutUint16(data[8:10], port)
+	// 埋入一个 IPv4 地址 192.168.1.1:1720
+	ipv4 := net.ParseIP("192.168.1.1").To4()
+	copy(data[60:64], ipv4)
+	binary.BigEndian.PutUint16(data[64:66], 1720)
 
 	addrs := ScanTransportAddresses(data)
-
-	found := false
-	for _, addr := range addrs {
-		if !addr.IsIPv6 && addr.IP.Equal(ipv4) && addr.Port == port {
-			found = true
-		}
+	if len(addrs) != 2 {
+		t.Fatalf("应该找到 2 个地址, 实际: %d", len(addrs))
 	}
 
-	if !found {
-		t.Errorf("未能发现 IPv4 TransportAddress, 共扫描到 %d 个候选", len(addrs))
-		for _, a := range addrs {
-			t.Logf("  候选: offset=%d ipv6=%v ip=%s port=%d", a.Offset, a.IsIPv6, a.IP, a.Port)
-		}
+	if !addrs[0].IsIPv6 || addrs[0].Port != 1720 || !addrs[0].IP.Equal(ipv6) {
+		t.Errorf("IPv6 匹配错误: %+v", addrs[0])
 	}
 
-	t.Logf("✅ IPv4 TransportAddress 扫描成功")
+	if addrs[1].IsIPv6 || addrs[1].Port != 1720 || !addrs[1].IP.Equal(ipv4) {
+		t.Errorf("IPv4 匹配错误: %+v", addrs[1])
+	}
+	t.Log("✅ TransportAddress 启发式扫描成功")
 }
 
-func TestTranslateIPv6ToIPv4_H225(t *testing.T) {
-	translator := NewTranslator(net.ParseIP("198.51.100.1"))
+func TestTranslateIPv6ToIPv4(t *testing.T) {
+	tr := NewTranslator(net.ParseIP("10.0.0.1"))
+	data := make([]byte, 50)
+	
+	clientIPv6 := net.ParseIP("2001:db8::100")
+	mappedIPv4 := net.ParseIP("10.0.0.100").To4()
 
-	clientIPv6 := net.ParseIP("2001:db8::1").To16()
-	mappedIPv4 := net.ParseIP("198.51.100.1").To4()
+	// 埋入客户端 IPv6 地址
+	copy(data[10:26], clientIPv6)
+	binary.BigEndian.PutUint16(data[26:28], 50000)
 
-	// 模拟 H.225 二进制, 在 offset 10 处嵌入客户端 IPv6 地址
-	payload := make([]byte, 40)
-	payload[0] = 0x05 // ASN.1 header
-	payload[1] = 0x20
-	copy(payload[10:26], clientIPv6)
-	binary.BigEndian.PutUint16(payload[26:28], 1720) // port
-
-	result, err := translator.TranslateIPv6ToIPv4(payload, clientIPv6, mappedIPv4)
+	result, err := tr.TranslateIPv6ToIPv4(data, clientIPv6, mappedIPv4)
 	if err != nil {
-		t.Fatalf("TranslateIPv6ToIPv4 error: %v", err)
+		t.Fatalf("翻译失败: %v", err)
 	}
 
-	// 验证 IPv4 地址被写入原来 IPv6 地址开头的 4 字节
-	gotIP := net.IP(result.ModifiedPayload[10:14])
-	if !gotIP.Equal(mappedIPv4) {
-		t.Errorf("写入的 IPv4 = %s, want %s", gotIP, mappedIPv4)
+	// 检查是否替换成 IPv4 地址并清零
+	if !net.IP(result.ModifiedPayload[10:14]).Equal(mappedIPv4) {
+		t.Errorf("IPv4 替换失败: %v", result.ModifiedPayload[10:14])
 	}
-
-	// 验证后续 12 字节被清零
 	for i := 14; i < 26; i++ {
 		if result.ModifiedPayload[i] != 0 {
-			t.Errorf("offset %d 应为 0x00, got 0x%02X", i, result.ModifiedPayload[i])
+			t.Errorf("未正确清零 padding: index %d", i)
 		}
 	}
 
-	// 验证端口保持不变
-	port := binary.BigEndian.Uint16(result.ModifiedPayload[26:28])
-	if port != 1720 {
-		t.Errorf("端口 = %d, want 1720", port)
-	}
-
-	// 验证 DynamicPorts 记录
-	if len(result.DynamicPorts) != 1 {
-		t.Errorf("DynamicPorts 数量 = %d, want 1", len(result.DynamicPorts))
+	if len(result.MediaPorts) != 1 {
+		t.Errorf("未记录媒体端口")
 	} else {
-		dp := result.DynamicPorts[0]
-		if dp.Purpose != "H.225-CallSignaling" {
-			t.Errorf("Purpose = %s, want H.225-CallSignaling", dp.Purpose)
+		if result.MediaPorts[0].OriginalPort != 50000 || result.MediaPorts[0].Purpose != "RTP" {
+			t.Errorf("媒体端口信息错误: %+v", result.MediaPorts[0])
 		}
 	}
-
-	t.Logf("✅ H.225 IPv6→IPv4 TransportAddress 翻译成功")
+	t.Log("✅ IPv6->IPv4 TransportAddress 翻译成功")
 }
 
-func TestParseQ931(t *testing.T) {
-	// 构造最小 Q.931 消息:
-	// [0] Protocol Discriminator = 0x08
-	// [1] Call Reference Length = 2
-	// [2-3] Call Reference Value
-	// [4] Message Type = Setup (0x05)
-	// [5] User-User IE: type=0x7E, length=0x0005, data=0x05+4bytes
-	q931 := []byte{
-		0x08,       // Protocol Discriminator
-		0x02,       // CR Length
-		0x00, 0x01, // Call Reference
-		0x05,       // Message Type = Setup
-		// User-User IE
-		0x7E,       // IE type
-		0x00, 0x06, // IE length (6 bytes)
-		0x05,                         // UU Protocol Discriminator (ASN.1)
-		0x20, 0x00, 0x06, 0x00, 0x08, // 模拟 H.225 ASN.1 数据
+func TestQ931Parse(t *testing.T) {
+	// 构造一个简单的 Q.931 Setup 消息 (IE 用伪造数据)
+	// Header: [08] [01] [01] [05]
+	// IE: [7E] [00 06] [05] [AA BB CC DD EE]
+	data := []byte{
+		0x08, 0x01, 0x01, 0x05,
+		0x7E, 0x00, 0x06, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
 	}
 
-	msgType, h225Data, err := ParseQ931(q931)
+	msgType, h225Buf, err := ParseQ931(data)
 	if err != nil {
-		t.Fatalf("ParseQ931 error: %v", err)
+		t.Fatalf("Q.931 解析失败: %v", err)
 	}
 
-	if msgType != Q931Setup {
-		t.Errorf("Message Type = 0x%02x, want 0x%02x (Setup)", msgType, Q931Setup)
+	if msgType != Q931Setup || !bytes.Equal(h225Buf, []byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE}) {
+		t.Errorf("Q.931 解析不匹配: type=%v, payload=%v", msgType, h225Buf)
 	}
-
-	if h225Data == nil {
-		t.Fatalf("H.225 data 为 nil")
-	}
-
-	if len(h225Data) != 5 {
-		t.Errorf("H.225 data len = %d, want 5", len(h225Data))
-	}
-
-	t.Logf("✅ Q.931 解析成功, Message Type=Setup, H.225 数据长度=%d", len(h225Data))
+	t.Logf("✅ Q.931/H.225 解析成功, Message Type=%v, H.225 数据长度=%d", msgType, len(h225Buf))
 }
 
 func TestProcessH225Message(t *testing.T) {
-	translator := NewTranslator(net.ParseIP("198.51.100.1"))
-	clientIPv6 := net.ParseIP("2001:db8::1").To16()
-	mappedIPv4 := net.ParseIP("198.51.100.1").To4()
+	tr := NewTranslator(net.ParseIP("10.0.0.1"))
+	clientIPv6 := net.ParseIP("2001:db8::100")
+	mappedIPv4 := net.ParseIP("10.0.0.100").To4()
 
-	// 构造完整的 TPKT + Q.931 + H.225 消息, 其中 H.225 包含客户端的 IPv6 地址
+	// 构造完整 TPKT + Q.931 + H.225 (含 IPv6 地址)
 	h225Data := make([]byte, 30)
-	copy(h225Data[5:21], clientIPv6) // IPv6 TransportAddress @ offset 5
-	binary.BigEndian.PutUint16(h225Data[21:23], 1720)
+	copy(h225Data[5:21], clientIPv6)
+	binary.BigEndian.PutUint16(h225Data[21:23], 60000)
 
-	q931 := []byte{
-		0x08,       // Proto Disc
-		0x02,       // CR len
-		0x00, 0x01, // CR value
-		0x05, // Setup
-		0x7E, // User-User IE
-	}
-	ieLen := 1 + len(h225Data) // 1 for UU proto disc
-	q931 = append(q931, byte(ieLen>>8), byte(ieLen))
-	q931 = append(q931, 0x05) // UU proto disc
+	q931 := []byte{0x08, 0x01, 0x01, 0x05, 0x7E, 0x00, uint8(uint16(len(h225Data)+1) >> 8), uint8(len(h225Data) + 1), 0x05}
 	q931 = append(q931, h225Data...)
+	tpkt := SerializeTPKT(q931)
 
-	tpktFrame := SerializeTPKT(q931)
-
-	result, err := translator.ProcessH225Message(tpktFrame, clientIPv6, mappedIPv4, "6to4")
+	result, err := tr.ProcessH225Message(tpkt, clientIPv6, mappedIPv4, "6to4")
 	if err != nil {
-		t.Fatalf("ProcessH225Message error: %v", err)
+		t.Fatalf("ProcessH225Message failed: %v", err)
 	}
 
-	if result.ModifiedPayload == nil {
-		t.Fatalf("输出为 nil")
+	if len(result.MediaPorts) != 1 {
+		t.Errorf("应该找到 1 个端口, 实际: %d", len(result.MediaPorts))
 	}
-
-	if len(result.DynamicPorts) > 0 {
-		t.Logf("  发现 %d 个动态端口需要 NAT", len(result.DynamicPorts))
-		for _, dp := range result.DynamicPorts {
-			t.Logf("    %s: %s:%d -> %s:%d", dp.Purpose, dp.OriginalIP, dp.OriginalPort, dp.MappedIP, dp.MappedPort)
-		}
+	if result.MediaPorts[0].OriginalPort != 60000 {
+		t.Errorf("端口错误: %d", result.MediaPorts[0].OriginalPort)
 	}
-
-	t.Logf("✅ H.225 完整消息处理成功 (TPKT+Q.931+H.225)")
+	
+	// 验证最终 payload 中已经完成替换
+	// TPKT(4) + Q931_Fixed(4) + IE_Header(4) + X.680_Tag(1) + H225Offset(5) = 18
+	replacedIP := result.ModifiedPayload[18:22]
+	if !net.IP(replacedIP).Equal(mappedIPv4) {
+		t.Errorf("最终 IP 替换失败: %v", replacedIP)
+	}
+	t.Log("✅ H.225 完整链路处理成功")
 }

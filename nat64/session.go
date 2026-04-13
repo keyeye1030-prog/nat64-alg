@@ -46,9 +46,8 @@ type Session struct {
 	CreatedAt time.Time
 	LastSeen  time.Time
 
-	// TCP 序列号偏移追踪 (用于 ALG 修改载荷长度时)
-	SeqDelta int32 // 累积的 6->4 方向序列号偏移
-	AckDelta int32 // 累积的 4->6 方向确认号偏移
+	// ALG 相关
+	TCPTracker *TCPDeltaTracker // TCP 序列号修正 (仅在需要 ALG 的 TCP 会话中延迟初始化)
 }
 
 // SessionTable 是核心的有状态映射表, 使用分片锁降低竞争

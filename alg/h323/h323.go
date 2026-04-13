@@ -32,16 +32,14 @@ import (
 type ALGResult struct {
 	ModifiedPayload []byte
 	LengthDelta     int
-	DynamicPorts    []DynamicPort // H.245/RTP 动态端口
+	MediaPorts      []MediaPort // 发现的需要中继的媒体端口 (H.245, RTP, RTCP)
 }
 
-// DynamicPort 记录 H.245 协商的动态端口
-type DynamicPort struct {
+// MediaPort 表示 H.323 协商中的一个传输地址
+type MediaPort struct {
 	OriginalIP   net.IP
 	OriginalPort uint16
-	MappedIP     net.IP
-	MappedPort   uint16
-	Purpose      string // "H.245", "RTP", "RTCP", "T.120" etc.
+	Purpose      string // "RTP", "RTCP", "H.245"
 }
 
 // Translator 是 H.323 ALG 翻译器
@@ -247,11 +245,9 @@ func (t *Translator) TranslateIPv6ToIPv4(payload []byte, clientIPv6, mappedIPv4 
 		}
 		// 端口保持不变 (已在原位)
 
-		result.DynamicPorts = append(result.DynamicPorts, DynamicPort{
+		result.MediaPorts = append(result.MediaPorts, MediaPort{
 			OriginalIP:   addr.IP,
 			OriginalPort: addr.Port,
-			MappedIP:     mappedIPv4,
-			MappedPort:   addr.Port,
 			Purpose:      identifyPurpose(addr.Port),
 		})
 	}
@@ -281,11 +277,9 @@ func (t *Translator) TranslateIPv4ToIPv6(payload []byte, serverIPv4, clientIPv6 
 		// IPv4(6B) → IPv6(18B): 长度不匹配, 无法就地替换
 		// 这种场景需要完整的 PER 重编码
 		// 对于就地场景, 我们只能写入前4字节并记录需要重建
-		result.DynamicPorts = append(result.DynamicPorts, DynamicPort{
+		result.MediaPorts = append(result.MediaPorts, MediaPort{
 			OriginalIP:   addr.IP,
 			OriginalPort: addr.Port,
-			MappedIP:     clientIPv6,
-			MappedPort:   addr.Port,
 			Purpose:      identifyPurpose(addr.Port),
 		})
 	}
@@ -400,7 +394,7 @@ func (t *Translator) ProcessH225Message(data []byte, clientIPv6, mappedIPv4 net.
 	// 将修改后的 H.225 数据写回原始帧
 	result := &ALGResult{
 		ModifiedPayload: make([]byte, len(data)),
-		DynamicPorts:    algResult.DynamicPorts,
+		MediaPorts:      algResult.MediaPorts,
 	}
 	copy(result.ModifiedPayload, data)
 
