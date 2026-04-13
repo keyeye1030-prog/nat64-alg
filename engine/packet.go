@@ -6,8 +6,16 @@ import (
 	"nat64-alg/nat64"
 )
 
+// ============================================================================
+// 数据帧处理入口
+//
+// 单臂模式: processFrame() → 翻译 → sendFrame() (同一网卡)
+// 双臂模式: processIPv6Frame/processIPv4Frame → 翻译 → 跨网卡发送
+// ============================================================================
+
 // processFrame 处理从 AF_XDP 取到的一段原始二进制包帧（Raw Frame）
 // 它是整个数据平面的核心热路径 (hot path)
+// 单臂模式使用此函数
 func (e *XDPEngine) processFrame(frame []byte) {
 	if e.translator == nil {
 		return
@@ -32,7 +40,7 @@ func (e *XDPEngine) processFrame(frame []byte) {
 	}
 }
 
-// sendFrame 将帧写入 AF_XDP TX 队列
+// sendFrame 将帧写入 AF_XDP TX 队列 (单臂模式: 同一网卡)
 // TODO: 在真实实现中, 这里会调用 xsk 的发送接口
 func (e *XDPEngine) sendFrame(frame []byte) {
 	_ = frame // 占位: 真实实现中写入 UMEM TX ring

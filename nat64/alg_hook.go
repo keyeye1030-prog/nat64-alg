@@ -2,30 +2,39 @@ package nat64
 
 import (
 	"encoding/binary"
+	"fmt"
 	"log"
 	"net"
+	"strconv"
 
 	"nat64-alg/alg/h323"
+	"nat64-alg/alg/rtp"
 	"nat64-alg/alg/sip"
 )
 
 // ============================================================================
 // ALG (Application Layer Gateway) 集成层
-// 将 SIP 和 H.323 ALG 挂接到 NAT64 翻译管道中
+// 将 SIP、H.323 ALG 和 RTP 中继挂接到 NAT64 翻译管道中
 // ============================================================================
 
 // ALGHandler 管理所有应用层网关
 type ALGHandler struct {
 	sipTranslator  *sip.Translator
 	h323Translator *h323.Translator
+	relayManager   *rtp.RelayManager // RTP 媒体中继 (可选, 双臂模式下启用)
 }
 
-// NewALGHandler 创建 ALG 处理器
+// NewALGHandler 创建 ALG 处理器 (无 RTP 中继, 单臂模式)
 func NewALGHandler(poolIPv4 net.IP) *ALGHandler {
 	return &ALGHandler{
 		sipTranslator:  sip.NewTranslator(poolIPv4),
 		h323Translator: h323.NewTranslator(poolIPv4),
 	}
+}
+
+// SetRelayManager 注入 RTP 中继管理器 (双臂模式启用)
+func (a *ALGHandler) SetRelayManager(rm *rtp.RelayManager) {
+	a.relayManager = rm
 }
 
 // ALG 端口常量
@@ -94,11 +103,17 @@ func (a *ALGHandler) ProcessALG6to4(ipv4Pkt []byte, sess *Session) ([]byte, int)
 			log.Printf("[ALG-SIP] 6→4 处理失败: %v", err)
 			return ipv4Pkt, 0
 		}
-		modifiedPayload = result.ModifiedPayload
-		lengthDelta = result.LengthDelta
 
-		if len(result.MediaPorts) > 0 {
-			log.Printf("[ALG-SIP] 发现 %d 个媒体端口需要 RTP 中继", len(result.MediaPorts))
+		// 如果有 RTP 中继管理器, 为每个媒体端口分配中继
+		if a.relayManager != nil && len(result.MediaPorts) > 0 {
+			modifiedPayload, lengthDelta = a.allocateRelaysAndRewriteSDP(
+				result, sess, clientIPv6, mappedIPv4)
+		} else {
+			modifiedPayload = result.ModifiedPayload
+			lengthDelta = result.LengthDelta
+			if len(result.MediaPorts) > 0 {
+				log.Printf("[ALG-SIP] 发现 %d 个媒体端口 (RTP 中继未启用)", len(result.MediaPorts))
+			}
 		}
 
 	} else if isH323Port(srcPort, dstPort) {
@@ -219,4 +234,79 @@ func (a *ALGHandler) ProcessALG4to6(ipv6Pkt []byte, sess *Session) ([]byte, int)
 	recalcTransportChecksum6(newPkt, nextHeader)
 
 	return newPkt, lengthDelta
+}
+
+// ============================================================================
+// RTP 中继集成: 分配中继端口并就地修改已翻译的 SDP
+// ============================================================================
+
+// allocateRelaysAndRewriteSDP 在 SDP 已经做完 IPv6→IPv4 地址重写后,
+// 进一步为每个媒体流分配 RTP 中继端口, 并将 m= 行的端口替换为中继端口
+func (a *ALGHandler) allocateRelaysAndRewriteSDP(
+	sipResult *sip.ALGResult,
+	sess *Session,
+	clientIPv6, mappedIPv4 net.IP,
+) ([]byte, int) {
+
+	originalLen := len(sipResult.ModifiedPayload)
+	modifiedStr := string(sipResult.ModifiedPayload)
+
+	for _, mp := range sipResult.MediaPorts {
+		if mp.Proto != "RTP" {
+			continue // RTCP 端口跟随 RTP 端口 +1
+		}
+
+		// 从会话中提取远端 IPv4 地址
+		remoteIPv4 := net.IP(sess.Key4.DstIP[:]).To4()
+
+		// 分配中继
+		callID := fmt.Sprintf("sess-%d-%d", sess.Key6.SrcPort, sess.Key6.DstPort)
+		relay, err := a.relayManager.AllocateRelay(
+			callID,
+			clientIPv6, mp.OriginalPort,    // IPv6 终端
+			remoteIPv4, mp.OriginalPort,    // IPv4 终端 (初始端口, 会被首包学习更新)
+		)
+		if err != nil {
+			log.Printf("[ALG-RTP] 分配中继失败: %v", err)
+			continue
+		}
+
+		// 获取中继绑定地址
+		_, relayIPv4 := a.relayManager.GetRelayInfo(relay.LocalPort4)
+
+		// 在已翻译的 SDP 中, 将 m=audio ORIGINAL_PORT 替换为 m=audio RELAY_PORT
+		oldPort := strconv.Itoa(int(mp.OriginalPort))
+		newPort := strconv.Itoa(int(relay.LocalPort4))
+
+		// 精确替换 m= 行中的端口 (避免替换其他数字)
+		oldMedia := "m=audio " + oldPort
+		newMedia := "m=audio " + newPort
+		modifiedStr = replaceFirst(modifiedStr, oldMedia, newMedia)
+
+		// 同时替换 a=rtcp: 行
+		oldRtcp := "a=rtcp:" + strconv.Itoa(int(mp.OriginalPort)+1)
+		newRtcp := "a=rtcp:" + strconv.Itoa(int(relay.LocalPort4)+1)
+		modifiedStr = replaceFirst(modifiedStr, oldRtcp, newRtcp)
+
+		log.Printf("[ALG-RTP] 已分配中继: %s:%d ↔ %s:%d (中继端口: %d)",
+			clientIPv6, mp.OriginalPort, relayIPv4, mp.OriginalPort, relay.LocalPort4)
+	}
+
+	result := []byte(modifiedStr)
+	return result, len(result) - originalLen + sipResult.LengthDelta
+}
+
+// replaceFirst 替换字符串中第一个匹配项
+func replaceFirst(s, old, new string) string {
+	idx := len(s) // 如果找不到就不替换
+	for i := 0; i <= len(s)-len(old); i++ {
+		if s[i:i+len(old)] == old {
+			idx = i
+			break
+		}
+	}
+	if idx < len(s) {
+		return s[:idx] + new + s[idx+len(old):]
+	}
+	return s
 }
