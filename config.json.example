@@ -1,0 +1,10 @@
+{
+  "mode": "dual",
+  "pool_ipv4": "198.51.100.1",
+  "interface": "eth0",
+  "iface_ipv6": "eth0",
+  "iface_ipv4": "eth1",
+  "gw_ipv6": "2001:db8::1",
+  "rtp_port_start": 20000,
+  "rtp_port_end": 30000
+}

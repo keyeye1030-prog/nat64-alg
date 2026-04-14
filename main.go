@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -11,15 +13,25 @@ import (
 	"nat64-alg/engine"
 )
 
+type Config struct {
+	Mode         string `json:"mode"`
+	PoolIPv4     string `json:"pool_ipv4"`
+	Interface    string `json:"interface"`      // 单臂模式下使用的网卡
+	IfaceIPv6    string `json:"iface_ipv6"`     // 双臂模式 IPv6侧网卡
+	IfaceIPv4    string `json:"iface_ipv4"`     // 双臂模式 IPv4侧网卡
+	GwIPv6       string `json:"gw_ipv6"`        // 网关IPv6地址
+	RTPPortStart uint   `json:"rtp_port_start"` // 中继端口范围起点
+	RTPPortEnd   uint   `json:"rtp_port_end"`   // 中继端口范围终点
+}
+
 func main() {
-	// 通用参数
+	var cfgPath string
+	flag.StringVar(&cfgPath, "config", "", "Path to config.json. If provided, overrides other CLI flags.")
+
+	// Default CLI flags
 	mode := flag.String("mode", "single", "部署模式: single (单臂) 或 dual (双臂双网卡)")
 	poolIP := flag.String("pool-ipv4", "198.51.100.1", "NAT64 网关的 IPv4 出口地址")
-
-	// 单臂模式参数
 	iface := flag.String("interface", "eth0", "[单臂模式] 网卡名称")
-
-	// 双臂模式参数
 	iface6 := flag.String("iface-ipv6", "eth0", "[双臂模式] IPv6 侧网卡名称")
 	iface4 := flag.String("iface-ipv4", "eth1", "[双臂模式] IPv4 侧网卡名称")
 	gwIPv6 := flag.String("gw-ipv6", "", "[双臂模式] 网关 IPv6 地址 (用于 RTP 中继绑定)")
@@ -28,24 +40,46 @@ func main() {
 
 	flag.Parse()
 
-	poolIPv4 := net.ParseIP(*poolIP).To4()
+	cfg := Config{
+		Mode:         *mode,
+		PoolIPv4:     *poolIP,
+		Interface:    *iface,
+		IfaceIPv6:    *iface6,
+		IfaceIPv4:    *iface4,
+		GwIPv6:       *gwIPv6,
+		RTPPortStart: *rtpStart,
+		RTPPortEnd:   *rtpEnd,
+	}
+
+	if cfgPath != "" {
+		data, err := ioutil.ReadFile(cfgPath)
+		if err != nil {
+			log.Fatalf("无法读取配置文件: %v", err)
+		}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			log.Fatalf("无法解析配置文件: %v", err)
+		}
+		log.Printf("Loaded configuration from %s", cfgPath)
+	}
+
+	poolIPv4 := net.ParseIP(cfg.PoolIPv4).To4()
 	if poolIPv4 == nil {
-		log.Fatalf("无效的 IPv4 地址: %s", *poolIP)
+		log.Fatalf("无效的 IPv4 地址: %s", cfg.PoolIPv4)
 	}
 
 	log.Printf("======================================")
 	log.Printf("  NAT64-ALG Engine")
-	log.Printf("  Mode     : %s", *mode)
+	log.Printf("  Mode     : %s", cfg.Mode)
 	log.Printf("  Pool IPv4: %s", poolIPv4)
 	log.Printf("======================================")
 
-	switch *mode {
+	switch cfg.Mode {
 	case "single":
-		startSingleMode(*iface, poolIPv4)
+		startSingleMode(cfg.Interface, poolIPv4)
 	case "dual":
-		startDualMode(*iface6, *iface4, poolIPv4, *gwIPv6, uint16(*rtpStart), uint16(*rtpEnd))
+		startDualMode(cfg.IfaceIPv6, cfg.IfaceIPv4, poolIPv4, cfg.GwIPv6, uint16(cfg.RTPPortStart), uint16(cfg.RTPPortEnd))
 	default:
-		log.Fatalf("未知的部署模式: %s (支持: single, dual)", *mode)
+		log.Fatalf("未知的部署模式: %s (支持: single, dual)", cfg.Mode)
 	}
 }
 
