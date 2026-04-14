@@ -2,6 +2,7 @@ package nat64
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -60,12 +61,17 @@ type SessionTable struct {
 	portMu     sync.Mutex
 	sessionTTL time.Duration
 
-	staticMappings map[string]net.IP // Static 1:1 mappings
+	staticMappings    map[string]net.IP // Static 1:1 mappings (IPv6 -> IPv4)
+	staticMappingsRev map[string]net.IP // Reverse mappings (IPv4 -> IPv6) for inbound
 }
 
-// SetStaticMappings injects a static IP map
+// SetStaticMappings injects a static IP map and builds its reverse lookups
 func (st *SessionTable) SetStaticMappings(mappings map[string]net.IP) {
 	st.staticMappings = mappings
+	st.staticMappingsRev = make(map[string]net.IP)
+	for ip6, ip4 := range mappings {
+		st.staticMappingsRev[ip4.String()] = net.ParseIP(ip6)
+	}
 }
 
 type sessionShard struct {
@@ -224,13 +230,59 @@ func (st *SessionTable) LookupByMappedPort(mappedIP, remoteIP net.IP, remotePort
 	shard := &st.shards[idx]
 
 	shard.mu.RLock()
-	defer shard.mu.RUnlock()
-
 	sess, ok := shard.byKey4[key4]
 	if ok {
 		sess.LastSeen = time.Now()
+		shard.mu.RUnlock()
+		return sess, true
 	}
-	return sess, ok
+	shard.mu.RUnlock()
+
+	// [自动打洞] 核心升级: 全克隆(Full-Cone) 入站自动分配
+	// 如果找不到现存的 Session, 但是外部打入的地址是配置在 `static_mappings` 上的静态暴露 IP,
+	// 那么我们反演构建一个新 Session 放行此 inbound traffic!
+	if st.staticMappingsRev != nil {
+		if ipv6Target, exists := st.staticMappingsRev[mappedIP.To4().String()]; exists {
+			remoteIPv6 := IPv4ToIPv6(remoteIP)
+			if remoteIPv6 != nil {
+				var key6 SessionKey6
+				copy(key6.SrcIP[:], ipv6Target.To16())
+				copy(key6.DstIP[:], remoteIPv6.To16())
+				key6.SrcPort = mappedPort
+				key6.DstPort = remotePort
+				key6.Proto = proto
+
+				shard.mu.Lock()
+				// double check
+				if doubleSess, doubleOk := shard.byKey4[key4]; doubleOk {
+					shard.mu.Unlock()
+					return doubleSess, true
+				}
+
+				sess = &Session{
+					Key6:      key6,
+					Key4:      key4,
+					CreatedAt: time.Now(),
+					LastSeen:  time.Now(),
+				}
+				shard.byKey4[key4] = sess
+				shard.mu.Unlock()
+
+				idx6 := shardIndex(sess.Key6.SrcPort)
+				shard6 := &st.shards[idx6]
+				shard6.mu.Lock()
+				shard6.byKey6[sess.Key6] = sess
+				shard6.mu.Unlock()
+
+				log.Printf("[NAT64 Inbound] 自动穿透: 创建反向全克隆映射 %s:%d (IPv4) -> %s:%d (IPv6)",
+					mappedIP, mappedPort, ipv6Target, mappedPort)
+
+				return sess, true
+			}
+		}
+	}
+
+	return nil, false
 }
 
 // allocatePort 简单轮询分配端口
