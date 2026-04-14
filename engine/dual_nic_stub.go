@@ -20,13 +20,14 @@ type DualNICEngine struct {
 }
 
 type DualNICConfig struct {
-	IPv6Interface string
-	IPv4Interface string
-	PoolIPv4      net.IP
-	GatewayIPv6   net.IP
-	RTPPortStart  uint16
-	RTPPortEnd    uint16
-	SessionTTL    time.Duration
+	IPv6Interface  string
+	IPv4Interface  string
+	PoolIPv4       net.IP
+	GatewayIPv6    net.IP
+	RTPPortStart   uint16
+	RTPPortEnd     uint16
+	SessionTTL     time.Duration
+	StaticMappings map[string]net.IP // 一对一静态映射 stub
 }
 
 func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
@@ -43,6 +44,9 @@ func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
 	}
 
 	sessionTable := nat64.NewSessionTable(config.PoolIPv4, 10000, 60000, config.SessionTTL)
+	if config.StaticMappings != nil {
+		sessionTable.SetStaticMappings(config.StaticMappings)
+	}
 	translator := nat64.NewTranslator(config.PoolIPv4, sessionTable)
 
 	gwIPv6 := config.GatewayIPv6

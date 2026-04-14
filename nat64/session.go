@@ -59,6 +59,13 @@ type SessionTable struct {
 	nextPort   uint16   // 下一个分配端口 (简单轮询)
 	portMu     sync.Mutex
 	sessionTTL time.Duration
+
+	staticMappings map[string]net.IP // Static 1:1 mappings
+}
+
+// SetStaticMappings injects a static IP map
+func (st *SessionTable) SetStaticMappings(mappings map[string]net.IP) {
+	st.staticMappings = mappings
 }
 
 type sessionShard struct {
@@ -113,10 +120,25 @@ func (st *SessionTable) Lookup6to4(key6 SessionKey6) (*Session, error) {
 		return sess, nil
 	}
 
-	// 分配 IPv4 出口端口
-	mappedPort, err := st.allocatePort()
-	if err != nil {
-		return nil, err
+	// 1:1 Static mapping check
+	isStatic := false
+	mappedIPv4 := st.poolIPv4.To4()
+	mappedPort := key6.SrcPort // default explicitly to original port
+
+	if st.staticMappings != nil {
+		if staticIP, ok := st.staticMappings[net.IP(key6.SrcIP[:]).String()]; ok {
+			mappedIPv4 = staticIP.To4()
+			isStatic = true
+		}
+	}
+
+	if !isStatic {
+		// 分配 IPv4 出口动态端口 (N:1 PAT)
+		var err error
+		mappedPort, err = st.allocatePort()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// 提取 IPv4 目的地址 (从 NAT64 合成地址)
@@ -137,7 +159,7 @@ func (st *SessionTable) Lookup6to4(key6 SessionKey6) (*Session, error) {
 		CreatedAt: now,
 		LastSeen:  now,
 	}
-	copy(sess.Key4.SrcIP[:], st.poolIPv4.To4())
+	copy(sess.Key4.SrcIP[:], mappedIPv4)
 	copy(sess.Key4.DstIP[:], dstIPv4.To4())
 
 	// 存储 IPv6 正向索引 (在当前 shard 中)

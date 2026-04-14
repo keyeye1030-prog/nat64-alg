@@ -54,13 +54,14 @@ type DualNICEngine struct {
 
 // DualNICConfig 双网卡引擎配置
 type DualNICConfig struct {
-	IPv6Interface string // 面向 IPv6 网络的接口名 (如 eth0)
-	IPv4Interface string // 面向 IPv4 网络的接口名 (如 eth1)
-	PoolIPv4      net.IP // NAT64 池地址 (IPv4 出口地址)
-	GatewayIPv6   net.IP // 网关自身的 IPv6 地址 (用于 RTP 中继绑定)
-	RTPPortStart  uint16 // RTP 中继端口范围起点
-	RTPPortEnd    uint16 // RTP 中继端口范围终点
-	SessionTTL    time.Duration
+	IPv6Interface  string            // 面向 IPv6 网络的接口名 (如 eth0)
+	IPv4Interface  string            // 面向 IPv4 网络的接口名 (如 eth1)
+	PoolIPv4       net.IP            // NAT64 池地址 (IPv4 出口默认地址)
+	GatewayIPv6    net.IP            // 网关自身的 IPv6 地址 (用于 RTP 中继绑定)
+	RTPPortStart   uint16            // RTP 中继端口范围起点
+	RTPPortEnd     uint16            // RTP 中继端口范围终点
+	SessionTTL     time.Duration
+	StaticMappings map[string]net.IP // 一对一静态 IP 映射表 (IPv6 -> IPv4)
 }
 
 // NewDualNICEngine 创建双臂双网卡引擎
@@ -92,6 +93,9 @@ func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
 
 	// 初始化 NAT64 核心
 	sessionTable := nat64.NewSessionTable(config.PoolIPv4, 10000, 60000, config.SessionTTL)
+	if config.StaticMappings != nil {
+		sessionTable.SetStaticMappings(config.StaticMappings)
+	}
 	translator := nat64.NewTranslator(config.PoolIPv4, sessionTable)
 
 	// 初始化 RTP 中继

@@ -22,6 +22,7 @@ type Config struct {
 	GwIPv6       string `json:"gw_ipv6"`        // 网关IPv6地址
 	RTPPortStart uint   `json:"rtp_port_start"` // 中继端口范围起点
 	RTPPortEnd   uint   `json:"rtp_port_end"`   // 中继端口范围终点
+	StaticMaps   map[string]string `json:"static_mappings"` // 一对一静态 IP 映射 (IPv6 -> IPv4)
 }
 
 func main() {
@@ -77,7 +78,7 @@ func main() {
 	case "single":
 		startSingleMode(cfg.Interface, poolIPv4)
 	case "dual":
-		startDualMode(cfg.IfaceIPv6, cfg.IfaceIPv4, poolIPv4, cfg.GwIPv6, uint16(cfg.RTPPortStart), uint16(cfg.RTPPortEnd))
+		startDualMode(cfg.IfaceIPv6, cfg.IfaceIPv4, poolIPv4, cfg.GwIPv6, uint16(cfg.RTPPortStart), uint16(cfg.RTPPortEnd), cfg.StaticMaps)
 	default:
 		log.Fatalf("未知的部署模式: %s (支持: single, dual)", cfg.Mode)
 	}
@@ -99,7 +100,7 @@ func startSingleMode(ifaceName string, poolIPv4 net.IP) {
 }
 
 // startDualMode 启动双臂双网卡模式
-func startDualMode(iface6, iface4 string, poolIPv4 net.IP, gwIPv6Str string, rtpStart, rtpEnd uint16) {
+func startDualMode(iface6, iface4 string, poolIPv4 net.IP, gwIPv6Str string, rtpStart, rtpEnd uint16, staticMaps map[string]string) {
 	log.Printf("  IPv6 NIC : %s", iface6)
 	log.Printf("  IPv4 NIC : %s", iface4)
 	log.Printf("  RTP Ports: %d-%d", rtpStart, rtpEnd)
@@ -113,13 +114,29 @@ func startDualMode(iface6, iface4 string, poolIPv4 net.IP, gwIPv6Str string, rtp
 		log.Printf("  GW IPv6  : %s", gatewayIPv6)
 	}
 
+	staticIPs := make(map[string]net.IP)
+	for ip6, ip4 := range staticMaps {
+		parsed6 := net.ParseIP(ip6)
+		parsed4 := net.ParseIP(ip4).To4()
+		if parsed6 != nil && parsed4 != nil {
+			// key using the standard 16-byte representation for strict matching
+			staticIPs[parsed6.To16().String()] = parsed4
+		} else {
+			log.Printf("警告: 无效的静态映射配置 - [%s] -> [%s]", ip6, ip4)
+		}
+	}
+	if len(staticIPs) > 0 {
+		log.Printf("  Static Map : %d rules loaded", len(staticIPs))
+	}
+
 	config := engine.DualNICConfig{
-		IPv6Interface: iface6,
-		IPv4Interface: iface4,
-		PoolIPv4:      poolIPv4,
-		GatewayIPv6:   gatewayIPv6,
-		RTPPortStart:  rtpStart,
-		RTPPortEnd:    rtpEnd,
+		IPv6Interface:  iface6,
+		IPv4Interface:  iface4,
+		PoolIPv4:       poolIPv4,
+		GatewayIPv6:    gatewayIPv6,
+		RTPPortStart:   rtpStart,
+		RTPPortEnd:     rtpEnd,
+		StaticMappings: staticIPs,
 	}
 
 	dualEngine, err := engine.NewDualNICEngine(config)
