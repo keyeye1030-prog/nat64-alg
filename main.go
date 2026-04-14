@@ -14,9 +14,9 @@ import (
 )
 
 type Config struct {
-	Mode         string `json:"mode"`
-	PoolIPv4     string `json:"pool_ipv4"`
-	Interface    string `json:"interface"`      // 单臂模式下使用的网卡
+	Mode         string   `json:"mode"`
+	PoolIPv4s    []string `json:"pool_ipv4s"`
+	Interface    string   `json:"interface"`      // 单臂模式下使用的网卡
 	IfaceIPv6    string `json:"iface_ipv6"`     // 双臂模式 IPv6侧网卡
 	IfaceIPv4    string `json:"iface_ipv4"`     // 双臂模式 IPv4侧网卡
 	GwIPv6       string `json:"gw_ipv6"`        // 网关IPv6地址
@@ -43,13 +43,15 @@ func main() {
 
 	cfg := Config{
 		Mode:         *mode,
-		PoolIPv4:     *poolIP,
 		Interface:    *iface,
 		IfaceIPv6:    *iface6,
 		IfaceIPv4:    *iface4,
 		GwIPv6:       *gwIPv6,
 		RTPPortStart: *rtpStart,
 		RTPPortEnd:   *rtpEnd,
+	}
+	if *poolIP != "" {
+		cfg.PoolIPv4s = []string{*poolIP}
 	}
 
 	if cfgPath != "" {
@@ -63,32 +65,39 @@ func main() {
 		log.Printf("Loaded configuration from %s", cfgPath)
 	}
 
-	poolIPv4 := net.ParseIP(cfg.PoolIPv4).To4()
-	if poolIPv4 == nil {
-		log.Fatalf("无效的 IPv4 地址: %s", cfg.PoolIPv4)
+	var poolIPv4s []net.IP
+	for _, ipStr := range cfg.PoolIPv4s {
+		ip := net.ParseIP(ipStr).To4()
+		if ip == nil {
+			log.Fatalf("无效的 IPv4 地址: %s", ipStr)
+		}
+		poolIPv4s = append(poolIPv4s, ip)
+	}
+	if len(poolIPv4s) == 0 {
+		log.Fatalf("必须配置至少一个 Pool IPv4 地址")
 	}
 
 	log.Printf("======================================")
 	log.Printf("  NAT64-ALG Engine")
 	log.Printf("  Mode     : %s", cfg.Mode)
-	log.Printf("  Pool IPv4: %s", poolIPv4)
+	log.Printf("  Pool IPv4: %d IPs loaded", len(poolIPv4s))
 	log.Printf("======================================")
 
 	switch cfg.Mode {
 	case "single":
-		startSingleMode(cfg.Interface, poolIPv4)
+		startSingleMode(cfg.Interface, poolIPv4s)
 	case "dual":
-		startDualMode(cfg.IfaceIPv6, cfg.IfaceIPv4, poolIPv4, cfg.GwIPv6, uint16(cfg.RTPPortStart), uint16(cfg.RTPPortEnd), cfg.StaticMaps)
+		startDualMode(cfg.IfaceIPv6, cfg.IfaceIPv4, poolIPv4s, cfg.GwIPv6, uint16(cfg.RTPPortStart), uint16(cfg.RTPPortEnd), cfg.StaticMaps)
 	default:
 		log.Fatalf("未知的部署模式: %s (支持: single, dual)", cfg.Mode)
 	}
 }
 
 // startSingleMode 启动单臂模式 (原有模式)
-func startSingleMode(ifaceName string, poolIPv4 net.IP) {
+func startSingleMode(ifaceName string, poolIPv4s []net.IP) {
 	log.Printf("  Interface: %s", ifaceName)
 
-	xdpEngine, err := engine.NewXDPEngine(ifaceName, poolIPv4)
+	xdpEngine, err := engine.NewXDPEngine(ifaceName, poolIPv4s[0]) // single mode may only fully support first IP in XDP currently
 	if err != nil {
 		log.Fatalf("Failed to init XDP engine: %v", err)
 	}
@@ -100,7 +109,7 @@ func startSingleMode(ifaceName string, poolIPv4 net.IP) {
 }
 
 // startDualMode 启动双臂双网卡模式
-func startDualMode(iface6, iface4 string, poolIPv4 net.IP, gwIPv6Str string, rtpStart, rtpEnd uint16, staticMaps map[string]string) {
+func startDualMode(iface6, iface4 string, poolIPv4s []net.IP, gwIPv6Str string, rtpStart, rtpEnd uint16, staticMaps map[string]string) {
 	log.Printf("  IPv6 NIC : %s", iface6)
 	log.Printf("  IPv4 NIC : %s", iface4)
 	log.Printf("  RTP Ports: %d-%d", rtpStart, rtpEnd)
@@ -132,7 +141,7 @@ func startDualMode(iface6, iface4 string, poolIPv4 net.IP, gwIPv6Str string, rtp
 	config := engine.DualNICConfig{
 		IPv6Interface:  iface6,
 		IPv4Interface:  iface4,
-		PoolIPv4:       poolIPv4,
+		PoolIPv4s:      poolIPv4s,
 		GatewayIPv6:    gatewayIPv6,
 		RTPPortStart:   rtpStart,
 		RTPPortEnd:     rtpEnd,

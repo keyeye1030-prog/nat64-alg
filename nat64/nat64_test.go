@@ -340,7 +340,7 @@ func TestICMPv6PacketTooBig_ToICMPv4(t *testing.T) {
 
 func TestSessionTable_LookupAndReverse(t *testing.T) {
 	poolIPv4 := net.ParseIP("198.51.100.1").To4()
-	st := NewSessionTable(poolIPv4, 10000, 60000, 30000000000) // 30s TTL
+	st := NewSessionTable([]net.IP{poolIPv4}, 10000, 60000, 30000000000) // 30s TTL
 
 	srcIPv6 := net.ParseIP("2001:db8::1").To16()
 	dstIPv6 := net.ParseIP("64:ff9b::c0a8:0101").To16()
@@ -375,12 +375,12 @@ func TestSessionTable_LookupAndReverse(t *testing.T) {
 	// 反向查找: 模拟收到 192.168.1.1:80 -> 198.51.100.1:mappedPort 的回包
 	// 使用 LookupByMappedPort: remoteIP=192.168.1.1, remotePort=80, mappedPort=sess.Key4.SrcPort
 	remoteIPv4 := net.ParseIP("192.168.1.1").To4()
-	revSess, ok := st.LookupByMappedPort(remoteIPv4, 80, sess.Key4.SrcPort, ProtoTCP)
+	foundSess, ok := st.LookupByMappedPort(poolIPv4, remoteIPv4, 80, sess.Key4.SrcPort, ProtoNumTCPNum)
 	if !ok {
 		t.Fatalf("LookupByMappedPort 找不到反向会话")
 	}
-	if revSess.Key6.SrcPort != 54321 {
-		t.Errorf("反向会话 SrcPort = %d, want 54321", revSess.Key6.SrcPort)
+	if foundSess.Key6.SrcPort != 54321 {
+		t.Errorf("反向会话 SrcPort = %d, want 54321", foundSess.Key6.SrcPort)
 	}
 
 	// 统计
@@ -395,7 +395,7 @@ func TestSessionTable_LookupAndReverse(t *testing.T) {
 
 func TestPipeline_IPv6UDPtoIPv4(t *testing.T) {
 	poolIPv4 := net.ParseIP("198.51.100.1").To4()
-	st := NewSessionTable(poolIPv4, 10000, 60000, 30000000000)
+	st := NewSessionTable([]net.IP{poolIPv4}, 10000, 60000, 30000000000)
 	translator := NewTranslator(poolIPv4, st)
 
 	// 构造 IPv6+UDP 以太帧

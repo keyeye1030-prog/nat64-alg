@@ -33,8 +33,10 @@ func NewXDPEngine(ifaceName string, poolIPv4 net.IP) (*XDPEngine, error) {
 	log.Printf("[XDPEngine] 准备挂载于网卡: %s (Index: %d)", eth.Name, eth.Index)
 
 	// 初始化 NAT64 会话表和翻译器
-	sessionTable := nat64.NewSessionTable(poolIPv4, 10000, 60000, 5*time.Minute)
-	translator := nat64.NewTranslator(poolIPv4, sessionTable)
+	// 统一为单节点配置数组
+	poolIPv4s := []net.IP{poolIPv4}
+	sessionTable := nat64.NewSessionTable(poolIPv4s, 10000, 60000, 5*time.Minute)
+	translator := nat64.NewTranslator(poolIPv4s[0], sessionTable)
 
 	engine := &XDPEngine{
 		ifaceName:  ifaceName,

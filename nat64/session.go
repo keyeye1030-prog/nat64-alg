@@ -53,7 +53,7 @@ type Session struct {
 // SessionTable 是核心的有状态映射表, 使用分片锁降低竞争
 type SessionTable struct {
 	shards     [256]sessionShard
-	poolIPv4   net.IP   // NAT64 网关的 IPv4 出口地址
+	poolIPv4s  []net.IP // NAT64 网关的多个 IPv4 出口地址 (地址池)
 	portStart  uint16   // 可分配端口范围起点
 	portEnd    uint16   // 可分配端口范围终点
 	nextPort   uint16   // 下一个分配端口 (简单轮询)
@@ -74,11 +74,15 @@ type sessionShard struct {
 	byKey4   map[SessionKey4]*Session
 }
 
-// NewSessionTable 创建有状态 NAT64 会话表
-// poolAddr: NAT64 网关用于出口的 IPv4 公网地址
-func NewSessionTable(poolAddr net.IP, portStart, portEnd uint16, ttl time.Duration) *SessionTable {
+// NewSessionTable 初始化会话表
+func NewSessionTable(poolAddrs []net.IP, portStart, portEnd uint16, ttl time.Duration) *SessionTable {
+	pool4s := make([]net.IP, len(poolAddrs))
+	for i, ip := range poolAddrs {
+		pool4s[i] = ip.To4()
+	}
+
 	st := &SessionTable{
-		poolIPv4:   poolAddr.To4(),
+		poolIPv4s:  pool4s,
 		portStart:  portStart,
 		portEnd:    portEnd,
 		nextPort:   portStart,
@@ -94,6 +98,16 @@ func NewSessionTable(poolAddr net.IP, portStart, portEnd uint16, ttl time.Durati
 // shardIndex 通过端口低 8 位简单分片
 func shardIndex(port uint16) uint8 {
 	return uint8(port & 0xFF)
+}
+
+// hashBasedIPv4 从地址池中稳定地选取一个地址 (IP 亲和性)
+func (st *SessionTable) hashBasedIPv4(ipv6Src [16]byte) net.IP {
+	var hash uint32
+	for _, b := range ipv6Src {
+		hash = (hash * 31) + uint32(b)
+	}
+	idx := hash % uint32(len(st.poolIPv4s))
+	return st.poolIPv4s[idx]
 }
 
 // Lookup6to4 根据 IPv6 侧的信息查找已有会话, 如果不存在则自动创建
@@ -120,9 +134,9 @@ func (st *SessionTable) Lookup6to4(key6 SessionKey6) (*Session, error) {
 		return sess, nil
 	}
 
-	// 1:1 Static mapping check
+	// 1:1 Static mapping check vs N:M PAT Hash Mapping
 	isStatic := false
-	mappedIPv4 := st.poolIPv4.To4()
+	mappedIPv4 := st.hashBasedIPv4(key6.SrcIP)
 	mappedPort := key6.SrcPort // default explicitly to original port
 
 	if st.staticMappings != nil {
@@ -197,12 +211,10 @@ func (st *SessionTable) Lookup4to6(key4 SessionKey4) (*Session, bool) {
 }
 
 // LookupByMappedPort 通过 NAT 映射端口查找反向会话
-// 当收到 IPv4 回包时, 回包的目的端口就是我们分配的 mappedPort
-// 回包的源信息: srcIP=远端服务器, srcPort=远端端口
-// 我们需要匹配: 存储的 Key4{SrcIP=pool, DstIP=srcIP, SrcPort=mappedPort, DstPort=srcPort}
-func (st *SessionTable) LookupByMappedPort(remoteIP net.IP, remotePort, mappedPort uint16, proto Protocol) (*Session, bool) {
+// 当收到 IPv4 回包时, 回包的目的端口就是我们分配的 mappedPort, 目的IP是我们绑定的 mappedIP
+func (st *SessionTable) LookupByMappedPort(mappedIP, remoteIP net.IP, remotePort, mappedPort uint16, proto Protocol) (*Session, bool) {
 	var key4 SessionKey4
-	copy(key4.SrcIP[:], st.poolIPv4.To4())
+	copy(key4.SrcIP[:], mappedIP.To4())
 	copy(key4.DstIP[:], remoteIP.To4())
 	key4.SrcPort = mappedPort
 	key4.DstPort = remotePort
@@ -261,6 +273,29 @@ func (st *SessionTable) CleanExpired() int {
 		shard.mu.Unlock()
 	}
 	return cleaned
+}
+
+// IsPoolIP checks if the given IPv4 address belongs to the dynamic NAT pool or static mappings
+func (st *SessionTable) IsPoolIP(ip net.IP) bool {
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return false
+	}
+	// Check static maps first
+	if st.staticMappings != nil {
+		for _, mapped := range st.staticMappings {
+			if mapped.To4().Equal(ipv4) {
+				return true
+			}
+		}
+	}
+	// Check dynamic pool
+	for _, poolIP := range st.poolIPv4s {
+		if poolIP.Equal(ipv4) {
+			return true
+		}
+	}
+	return false
 }
 
 // Stats 返回当前活跃会话数

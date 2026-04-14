@@ -56,7 +56,7 @@ type DualNICEngine struct {
 type DualNICConfig struct {
 	IPv6Interface  string            // 面向 IPv6 网络的接口名 (如 eth0)
 	IPv4Interface  string            // 面向 IPv4 网络的接口名 (如 eth1)
-	PoolIPv4       net.IP            // NAT64 池地址 (IPv4 出口默认地址)
+	PoolIPv4s      []net.IP          // NAT64 池地址 (多个 IPv4 出口默认地址)
 	GatewayIPv6    net.IP            // 网关自身的 IPv6 地址 (用于 RTP 中继绑定)
 	RTPPortStart   uint16            // RTP 中继端口范围起点
 	RTPPortEnd     uint16            // RTP 中继端口范围终点
@@ -92,16 +92,19 @@ func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
 	}
 
 	// 初始化 NAT64 核心
-	sessionTable := nat64.NewSessionTable(config.PoolIPv4, 10000, 60000, config.SessionTTL)
+	sessionTable := nat64.NewSessionTable(config.PoolIPv4s, 10000, 60000, config.SessionTTL)
 	if config.StaticMappings != nil {
 		sessionTable.SetStaticMappings(config.StaticMappings)
 	}
-	translator := nat64.NewTranslator(config.PoolIPv4, sessionTable)
+	// translator just needs the session table, but wait, translator also holds PoolIPv4 for some checks?
+	// Actually we should see what NewTranslator needs. We'll pass the first IP or modify Translator too.
+	translator := nat64.NewTranslator(config.PoolIPv4s[0], sessionTable)
 
 	// 初始化 RTP 中继
+	// RTP 中继绑定地址现在是动态协商的, pool 也可以传第一个或者不传
 	relayMgr := rtp.NewRelayManager(
 		config.GatewayIPv6,
-		config.PoolIPv4,
+		config.PoolIPv4s[0],
 		config.RTPPortStart,
 		config.RTPPortEnd,
 	)
@@ -120,7 +123,7 @@ func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
 	log.Printf("[DualNIC] 引擎初始化完成")
 	log.Printf("  IPv6 侧: %s", config.IPv6Interface)
 	log.Printf("  IPv4 侧: %s", config.IPv4Interface)
-	log.Printf("  Pool IPv4: %s", config.PoolIPv4)
+	log.Printf("  Pool IPv4: %d addresses", len(config.PoolIPv4s))
 	log.Printf("  RTP 端口: %d-%d", config.RTPPortStart, config.RTPPortEnd)
 
 	return engine, nil

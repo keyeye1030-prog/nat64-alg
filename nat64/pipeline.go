@@ -160,8 +160,8 @@ func (t *Translator) process4to6(dstMAC, srcMAC, ipv4Raw []byte) *ProcessResult 
 	srcIPv4 := net.IP(ipv4Raw[12:16]).To4()
 	dstIPv4 := net.IP(ipv4Raw[16:20]).To4()
 
-	// 检查目的 IP 是否是我们的 NAT64 池地址
-	if !dstIPv4.Equal(t.PoolIPv4) {
+	// 检查目的 IP 是否是我们的 NAT64 池地址或静态映射地址
+	if !t.SessionTable.IsPoolIP(dstIPv4) {
 		return &ProcessResult{Direction: DirPassthrough}
 	}
 
@@ -172,8 +172,8 @@ func (t *Translator) process4to6(dstMAC, srcMAC, ipv4Raw []byte) *ProcessResult 
 	}
 
 	// 查找反向会话
-	// 回包: srcIP=远端服务器, srcPort=远端端口, dstIP=我们(pool), dstPort=mappedPort
-	sess, ok := t.SessionTable.LookupByMappedPort(srcIPv4, srcPort, dstPort, proto)
+	// 回包: srcIP=远端服务器, srcPort=远端端口, dstIP=我们(pool或static), dstPort=mappedPort
+	sess, ok := t.SessionTable.LookupByMappedPort(dstIPv4, srcIPv4, srcPort, dstPort, proto)
 	if !ok {
 		return &ProcessResult{Error: fmt.Errorf("找不到反向会话: %s:%d -> %s:%d",
 			srcIPv4, srcPort, dstIPv4, dstPort)}

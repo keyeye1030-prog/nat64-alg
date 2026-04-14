@@ -22,7 +22,7 @@ type DualNICEngine struct {
 type DualNICConfig struct {
 	IPv6Interface  string
 	IPv4Interface  string
-	PoolIPv4       net.IP
+	PoolIPv4s      []net.IP
 	GatewayIPv6    net.IP
 	RTPPortStart   uint16
 	RTPPortEnd     uint16
@@ -43,11 +43,11 @@ func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
 		config.RTPPortEnd = 30000
 	}
 
-	sessionTable := nat64.NewSessionTable(config.PoolIPv4, 10000, 60000, config.SessionTTL)
+	sessionTable := nat64.NewSessionTable(config.PoolIPv4s, 10000, 60000, config.SessionTTL)
 	if config.StaticMappings != nil {
 		sessionTable.SetStaticMappings(config.StaticMappings)
 	}
-	translator := nat64.NewTranslator(config.PoolIPv4, sessionTable)
+	translator := nat64.NewTranslator(config.PoolIPv4s[0], sessionTable)
 
 	gwIPv6 := config.GatewayIPv6
 	if gwIPv6 == nil {
@@ -56,7 +56,7 @@ func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
 
 	relayMgr := rtp.NewRelayManager(
 		gwIPv6,
-		config.PoolIPv4,
+		config.PoolIPv4s[0],
 		config.RTPPortStart,
 		config.RTPPortEnd,
 	)

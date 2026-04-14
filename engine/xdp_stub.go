@@ -20,8 +20,9 @@ type XDPEngine struct {
 func NewXDPEngine(ifaceName string, poolIPv4 net.IP) (*XDPEngine, error) {
 	log.Println("[WARN] 目前运行于 非 Linux 环境，XDP 底层处于存根(Stub)旁路模式。")
 
-	sessionTable := nat64.NewSessionTable(poolIPv4, 10000, 60000, 5*time.Minute)
-	translator := nat64.NewTranslator(poolIPv4, sessionTable)
+	poolIPv4s := []net.IP{poolIPv4}
+	sessionTable := nat64.NewSessionTable(poolIPv4s, 10000, 60000, 5*time.Minute)
+	translator := nat64.NewTranslator(poolIPv4s[0], sessionTable)
 
 	return &XDPEngine{
 		ifaceName:  ifaceName,
