@@ -1,9 +1,11 @@
 package nat64
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net"
 	"testing"
+	"time"
 )
 
 // ============================================================================
@@ -392,6 +394,61 @@ func TestSessionTable_LookupAndReverse(t *testing.T) {
 }
 
 // ---------- Pipeline 完整端到端测试 ----------
+
+func TestSessionTable_InboundStaticMapping(t *testing.T) {
+	poolIPv4 := net.ParseIP("198.51.100.1").To4()
+	st := NewSessionTable([]net.IP{poolIPv4}, 10000, 60000, 30*time.Second)
+
+	// 配置一组静态保留 IP 映射: 2001:db8::10 -> 198.51.100.10
+	staticMaps := map[string]net.IP{
+		"2001:db8::10": net.ParseIP("198.51.100.10"),
+	}
+	st.SetStaticMappings(staticMaps)
+
+	// 模拟公网一台陌生终端的 TCP 入站请求:
+	// source 203.0.113.5:12345 向我们配置的保留 IP 198.51.100.10:5060 发起建单
+	remoteIP := net.ParseIP("203.0.113.5").To4()
+	mappedIP := net.ParseIP("198.51.100.10").To4()
+	var remotePort uint16 = 12345
+	var mappedPort uint16 = 5060
+
+	// 执行基于 Inbound 端口特征的反向查找与自动打洞
+	sess, ok := st.LookupByMappedPort(mappedIP, remoteIP, remotePort, mappedPort, ProtoNumTCPNum)
+	if !ok || sess == nil {
+		t.Fatalf("Inbound Static NAT 创建失败, LookupByMappedPort 返回 false")
+	}
+
+	// 验证打洞所生成的逆向 IPv6 会话参数
+	expectedIPv6Target := net.ParseIP("2001:db8::10").To16()
+	expectedIPv6Remote := IPv4ToIPv6(remoteIP).To16()
+
+	if !bytes.Equal(sess.Key6.SrcIP[:], expectedIPv6Target) {
+		t.Errorf("逆向构建的内网设备 IPv6 错误, want %s, got %s", expectedIPv6Target, net.IP(sess.Key6.SrcIP[:]))
+	}
+
+	if !bytes.Equal(sess.Key6.DstIP[:], expectedIPv6Remote) {
+		t.Errorf("逆向合成的 NAT64 远端 IPv6 错误, want %s, got %s", expectedIPv6Remote, net.IP(sess.Key6.DstIP[:]))
+	}
+
+	if sess.Key6.SrcPort != mappedPort {
+		t.Errorf("逆向分配保留端口失败, want %d, got %d", mappedPort, sess.Key6.SrcPort)
+	}
+
+	// 反证: 拿我们生成的虚拟内网 Key6，去正常按正向查找（类似内网回包了），应能立刻命中
+	forwardSess, err := st.Lookup6to4(sess.Key6)
+	if err != nil {
+		t.Fatalf("验证正向索引失败: %v", err)
+	}
+	if forwardSess != sess {
+		t.Errorf("由于索引断裂, 正反向找到的不是同一会话实例")
+	}
+
+	t.Logf("✅ Full-Cone Inbound 静态映射测试通过: %s:%d -> %s:%d 成功透传为 %s:%d -> %s:%d",
+		remoteIP, remotePort, mappedIP, mappedPort,
+		expectedIPv6Remote, remotePort, expectedIPv6Target, mappedPort)
+}
+
+// ---------- Pipeline 端到端完整包收发测试 ----------
 
 func TestPipeline_IPv6UDPtoIPv4(t *testing.T) {
 	poolIPv4 := net.ParseIP("198.51.100.1").To4()
