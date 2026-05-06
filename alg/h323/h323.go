@@ -174,10 +174,18 @@ func ScanTransportAddresses(data []byte) []TransportAddress {
 		port := binary.BigEndian.Uint16(data[i+4 : i+6])
 
 		if isPlausibleIPv4(ip4) && port > 0 && port < 65535 {
-			// 排除已被 IPv6 匹配覆盖的区间
+			// 排除与已匹配的 IPv6 TransportAddress 重叠的区间
+			// 扩大检查范围: IPv6 match 区域(offset..offset+length) 前后各扩展 6 字节
+			// 防止零填充区域产生的误报
 			overlaps := false
 			for _, r := range results {
-				if i >= r.Offset && i < r.Offset+r.Length {
+				// IPv4 的 6 字节区间 [i, i+6) 与 IPv6 的扩展区间 [r.Offset-6, r.Offset+r.Length+6) 有交集
+				extStart := r.Offset - 6
+				if extStart < 0 {
+					extStart = 0
+				}
+				extEnd := r.Offset + r.Length + 6
+				if i >= extStart && i < extEnd {
 					overlaps = true
 					break
 				}
@@ -443,19 +451,24 @@ func isPlausibleIPv6(ip net.IP) bool {
 	return false
 }
 
-// isPlausibleIPv4 判断 4 字节是否是看起来有效的 IPv4 地址
+// isPlausibleIPv4 判断 4 字节是否是看起来有效的 IPv4 单播地址
 func isPlausibleIPv4(ip net.IP) bool {
 	if len(ip) != 4 {
 		return false
 	}
-	// 排除 0.0.0.0 和 255.255.255.255
-	if ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0 {
+	// 排除 0.x.x.x (0/8 是保留网段, 不会出现在 H.323 信令中)
+	if ip[0] == 0 {
 		return false
 	}
+	// 排除 255.255.255.255 (广播)
 	if ip[0] == 255 && ip[1] == 255 && ip[2] == 255 && ip[3] == 255 {
 		return false
 	}
-	// 首字节至少应该在 1-223 (排除 multicast 224+)
+	// 排除 127.0.0.0/8 (回环)
+	if ip[0] == 127 {
+		return false
+	}
+	// 首字节在 1-223 (排除 multicast 224+ 和 class E 240+)
 	if ip[0] >= 224 {
 		return false
 	}

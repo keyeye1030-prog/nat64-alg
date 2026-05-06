@@ -139,7 +139,23 @@ func TestProcessH225Message(t *testing.T) {
 	copy(h225Data[5:21], clientIPv6)
 	binary.BigEndian.PutUint16(h225Data[21:23], 60000)
 
-	q931 := []byte{0x08, 0x01, 0x01, 0x05, 0x7E, 0x00, uint8(uint16(len(h225Data)+1) >> 8), uint8(len(h225Data) + 1), 0x05}
+	// Q.931 帧结构:
+	//   [0x08] Protocol Discriminator
+	//   [0x01] Call Reference Length = 1
+	//   [0x01] Call Reference Value
+	//   [0x05] Message Type = Setup
+	//   --- User-User IE ---
+	//   [0x7E] IE Type
+	//   [2 bytes] IE Length (big-endian, 包含 X.680 tag 和 H.225 数据)
+	//   [0x05] X.680 Protocol Discriminator (ASN.1)
+	//   [...] H.225 ASN.1 数据
+	ieContentLen := len(h225Data) + 1 // +1 for X.680 tag byte (0x05)
+	q931 := []byte{
+		0x08, 0x01, 0x01, 0x05, // Q.931 header
+		0x7E,                                           // User-User IE type
+		uint8(ieContentLen >> 8), uint8(ieContentLen),   // IE length (2 bytes, big-endian)
+		0x05,                                           // X.680 protocol discriminator
+	}
 	q931 = append(q931, h225Data...)
 	tpkt := SerializeTPKT(q931)
 
@@ -149,17 +165,17 @@ func TestProcessH225Message(t *testing.T) {
 	}
 
 	if len(result.MediaPorts) != 1 {
-		t.Errorf("应该找到 1 个端口, 实际: %d", len(result.MediaPorts))
+		t.Fatalf("应该找到 1 个端口, 实际: %d", len(result.MediaPorts))
 	}
 	if result.MediaPorts[0].OriginalPort != 60000 {
 		t.Errorf("端口错误: %d", result.MediaPorts[0].OriginalPort)
 	}
 	
 	// 验证最终 payload 中已经完成替换
-	// TPKT(4) + Q931_Fixed(4) + IE_Header(4) + X.680_Tag(1) + H225Offset(5) = 18
-	replacedIP := result.ModifiedPayload[18:22]
+	// TPKT(4) + Q931_Header(4) + IE_Type(1) + IE_Len(2) + X.680_Tag(1) + H225Offset(5) = 17
+	replacedIP := result.ModifiedPayload[17:21]
 	if !net.IP(replacedIP).Equal(mappedIPv4) {
-		t.Errorf("最终 IP 替换失败: %v", replacedIP)
+		t.Errorf("最终 IP 替换失败: got %v, want %v", net.IP(replacedIP), mappedIPv4)
 	}
 	t.Log("✅ H.225 完整链路处理成功")
 }
