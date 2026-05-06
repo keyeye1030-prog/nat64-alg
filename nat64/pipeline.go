@@ -25,6 +25,7 @@ type Translator struct {
 	SessionTable *SessionTable
 	PoolIPv4     net.IP // NAT64 网关的 IPv4 出口地址
 	ALG          *ALGHandler // SIP/H.323 应用层网关
+	MAC          *MACConfig  // 二层 MAC 地址配置
 	DebugLog     bool   // 是否输出每包调试日志
 
 	// 统计计数器 (原子操作)
@@ -40,6 +41,7 @@ func NewTranslator(poolIPv4 net.IP, table *SessionTable) *Translator {
 		SessionTable: table,
 		PoolIPv4:     poolIPv4.To4(),
 		ALG:          NewALGHandler(poolIPv4),
+		MAC:          NewMACConfig(),
 	}
 }
 
@@ -74,8 +76,18 @@ func (t *Translator) ProcessFrame(frame []byte) *ProcessResult {
 
 	switch etherType {
 	case EtherTypeIPv6:
+		// 从 IPv6 帧中学习源 MAC (将 srcIPv6 → srcMAC 记入邻居表)
+		if t.MAC != nil && t.MAC.Neighbors != nil && len(payload) >= IPv6HeaderLen {
+			srcIPv6 := net.IP(payload[8:24]).To16()
+			t.MAC.Neighbors.Learn(srcIPv6, srcMAC)
+		}
 		return t.process6to4(dstMAC, srcMAC, payload)
 	case EtherTypeIPv4:
+		// 从 IPv4 帧中学习源 MAC (将 srcIPv4 → srcMAC 记入邻居表)
+		if t.MAC != nil && t.MAC.Neighbors != nil && len(payload) >= IPv4HeaderMinLen {
+			srcIPv4 := net.IP(payload[12:16]).To4()
+			t.MAC.Neighbors.Learn(srcIPv4, srcMAC)
+		}
 		return t.process4to6(dstMAC, srcMAC, payload)
 	default:
 		// 非 IP 协议, 直接放行
@@ -114,7 +126,7 @@ func (t *Translator) process6to4(dstMAC, srcMAC, ipv6Raw []byte) *ProcessResult 
 			atomic.AddUint64(&t.PktsDropped, 1)
 			return &ProcessResult{Error: fmt.Errorf("6->4 分片翻译失败: %w", err)}
 		}
-		outputFrame := makeEtherFrame(srcMAC, dstMAC, EtherTypeIPv4, resultPayload)
+		outputFrame := t.buildOutputFrame6to4(dstIPv4, resultPayload)
 		atomic.AddUint64(&t.Pkts6to4, 1)
 		return &ProcessResult{OutputFrame: outputFrame, Direction: Dir6to4}
 	}
@@ -165,7 +177,7 @@ func (t *Translator) process6to4(dstMAC, srcMAC, ipv6Raw []byte) *ProcessResult 
 		return &ProcessResult{Error: fmt.Errorf("6->4 翻译失败: %w", err)}
 	}
 
-	outputFrame := makeEtherFrame(srcMAC, dstMAC, EtherTypeIPv4, resultPayload)
+	outputFrame := t.buildOutputFrame6to4(dstIPv4, resultPayload)
 	atomic.AddUint64(&t.Pkts6to4, 1)
 
 	if t.DebugLog {
@@ -256,7 +268,7 @@ func (t *Translator) process4to6(dstMAC, srcMAC, ipv4Raw []byte) *ProcessResult 
 		return &ProcessResult{Error: fmt.Errorf("4->6 翻译失败: %w", err)}
 	}
 
-	outputFrame := makeEtherFrame(srcMAC, dstMAC, EtherTypeIPv6, resultPayload)
+	outputFrame := t.buildOutputFrame4to6(origSrcIPv6, resultPayload)
 	atomic.AddUint64(&t.Pkts4to6, 1)
 
 	if t.DebugLog {
@@ -452,4 +464,45 @@ func makeEtherFrame(dstMAC, srcMAC []byte, etherType uint16, payload []byte) []b
 	binary.BigEndian.PutUint16(frame[12:14], etherType)
 	copy(frame[EtherHdrLen:], payload)
 	return frame
+}
+
+// buildOutputFrame6to4 构建 6→4 方向的输出以太帧
+// 使用 MACConfig 解析正确的目的 MAC (IPv4 侧网关) 和源 MAC (本机 eth1)
+func (t *Translator) buildOutputFrame6to4(dstIPv4 net.IP, ipv4Payload []byte) []byte {
+	if t.MAC == nil {
+		// 无 MAC 配置, 使用零 MAC (仅用于测试)
+		return makeEtherFrame(make([]byte, 6), make([]byte, 6), EtherTypeIPv4, ipv4Payload)
+	}
+
+	dstMAC := t.MAC.ResolveMAC4(dstIPv4)
+	srcMAC := t.MAC.LocalMAC4
+
+	if dstMAC == nil {
+		dstMAC = make(net.HardwareAddr, 6) // 无法解析时用零 MAC
+	}
+	if srcMAC == nil {
+		srcMAC = make(net.HardwareAddr, 6)
+	}
+
+	return makeEtherFrame(dstMAC, srcMAC, EtherTypeIPv4, ipv4Payload)
+}
+
+// buildOutputFrame4to6 构建 4→6 方向的输出以太帧
+// 使用 MACConfig 解析正确的目的 MAC (IPv6 终端或网关) 和源 MAC (本机 eth2)
+func (t *Translator) buildOutputFrame4to6(dstIPv6 net.IP, ipv6Payload []byte) []byte {
+	if t.MAC == nil {
+		return makeEtherFrame(make([]byte, 6), make([]byte, 6), EtherTypeIPv6, ipv6Payload)
+	}
+
+	dstMAC := t.MAC.ResolveMAC6(dstIPv6)
+	srcMAC := t.MAC.LocalMAC6
+
+	if dstMAC == nil {
+		dstMAC = make(net.HardwareAddr, 6)
+	}
+	if srcMAC == nil {
+		srcMAC = make(net.HardwareAddr, 6)
+	}
+
+	return makeEtherFrame(dstMAC, srcMAC, EtherTypeIPv6, ipv6Payload)
 }

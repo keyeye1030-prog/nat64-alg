@@ -58,6 +58,9 @@ type DualNICConfig struct {
 	IPv4Interface  string            // 面向 IPv4 网络的接口名 (如 eth1)
 	PoolIPv4s      []net.IP          // NAT64 池地址 (多个 IPv4 出口默认地址)
 	GatewayIPv6    net.IP            // 网关自身的 IPv6 地址 (用于 RTP 中继绑定)
+	IPv4GatewayMAC net.HardwareAddr  // IPv4 侧下一跳网关 MAC
+	IPv6GatewayMAC net.HardwareAddr  // IPv6 侧下一跳网关 MAC
+	EnableARPProxy bool              // 是否在用户态响应 ARP 请求
 	RTPPortStart   uint16            // RTP 中继端口范围起点
 	RTPPortEnd     uint16            // RTP 中继端口范围终点
 	SessionTTL     time.Duration
@@ -110,6 +113,17 @@ func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
 		sessionTable.SetStaticMappings(config.StaticMappings)
 	}
 	translator := nat64.NewTranslator(config.PoolIPv4s[0], sessionTable)
+
+	// 配置二层 MAC 地址
+	translator.MAC.GatewayMAC4 = config.IPv4GatewayMAC
+	translator.MAC.GatewayMAC6 = config.IPv6GatewayMAC
+	translator.MAC.LocalMAC6 = eth6.HardwareAddr
+	translator.MAC.LocalMAC4 = eth4.HardwareAddr
+	log.Printf("[DualNIC] MAC 配置:")
+	log.Printf("  eth6 本机 MAC: %s", eth6.HardwareAddr)
+	log.Printf("  eth4 本机 MAC: %s", eth4.HardwareAddr)
+	log.Printf("  IPv6 网关 MAC: %s", config.IPv6GatewayMAC)
+	log.Printf("  IPv4 网关 MAC: %s", config.IPv4GatewayMAC)
 
 	// 初始化 RTP 中继
 	relayMgr := rtp.NewRelayManager(

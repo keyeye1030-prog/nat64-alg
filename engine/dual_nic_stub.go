@@ -24,6 +24,9 @@ type DualNICConfig struct {
 	IPv4Interface  string
 	PoolIPv4s      []net.IP
 	GatewayIPv6    net.IP
+	IPv4GatewayMAC net.HardwareAddr
+	IPv6GatewayMAC net.HardwareAddr
+	EnableARPProxy bool
 	RTPPortStart   uint16
 	RTPPortEnd     uint16
 	SessionTTL     time.Duration

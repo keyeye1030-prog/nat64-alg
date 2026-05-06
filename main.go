@@ -13,15 +13,18 @@ import (
 )
 
 type Config struct {
-	Mode         string   `json:"mode"`
-	PoolIPv4s    []string `json:"pool_ipv4s"`
-	Interface    string   `json:"interface"`      // 单臂模式下使用的网卡
-	IfaceIPv6    string `json:"iface_ipv6"`     // 双臂模式 IPv6侧网卡
-	IfaceIPv4    string `json:"iface_ipv4"`     // 双臂模式 IPv4侧网卡
-	GwIPv6       string `json:"gw_ipv6"`        // 网关IPv6地址
-	RTPPortStart uint   `json:"rtp_port_start"` // 中继端口范围起点
-	RTPPortEnd   uint   `json:"rtp_port_end"`   // 中继端口范围终点
-	StaticMaps   map[string]string `json:"static_mappings"` // 一对一静态 IP 映射 (IPv6 -> IPv4)
+	Mode           string   `json:"mode"`
+	PoolIPv4s      []string `json:"pool_ipv4s"`
+	Interface      string   `json:"interface"`        // 单臂模式下使用的网卡
+	IfaceIPv6      string   `json:"iface_ipv6"`       // 双臂模式 IPv6侧网卡
+	IfaceIPv4      string   `json:"iface_ipv4"`       // 双臂模式 IPv4侧网卡
+	GwIPv6         string   `json:"gw_ipv6"`          // 网关IPv6地址
+	IPv4GatewayMAC string   `json:"ipv4_gateway_mac"` // IPv4 侧网关 MAC 地址
+	IPv6GatewayMAC string   `json:"ipv6_gateway_mac"` // IPv6 侧网关 MAC 地址
+	EnableARPProxy bool     `json:"enable_arp_proxy"` // 是否开启 ARP 代理
+	RTPPortStart   uint     `json:"rtp_port_start"`   // 中继端口范围起点
+	RTPPortEnd     uint     `json:"rtp_port_end"`     // 中继端口范围终点
+	StaticMaps     map[string]string `json:"static_mappings"` // 一对一静态 IP 映射 (IPv6 -> IPv4)
 }
 
 func main() {
@@ -86,7 +89,7 @@ func main() {
 	case "single":
 		startSingleMode(cfg.Interface, poolIPv4s)
 	case "dual":
-		startDualMode(cfg.IfaceIPv6, cfg.IfaceIPv4, poolIPv4s, cfg.GwIPv6, uint16(cfg.RTPPortStart), uint16(cfg.RTPPortEnd), cfg.StaticMaps)
+		startDualMode(cfg, poolIPv4s)
 	default:
 		log.Fatalf("未知的部署模式: %s (支持: single, dual)", cfg.Mode)
 	}
@@ -108,26 +111,49 @@ func startSingleMode(ifaceName string, poolIPv4s []net.IP) {
 }
 
 // startDualMode 启动双臂双网卡模式
-func startDualMode(iface6, iface4 string, poolIPv4s []net.IP, gwIPv6Str string, rtpStart, rtpEnd uint16, staticMaps map[string]string) {
-	log.Printf("  IPv6 NIC : %s", iface6)
-	log.Printf("  IPv4 NIC : %s", iface4)
-	log.Printf("  RTP Ports: %d-%d", rtpStart, rtpEnd)
+func startDualMode(cfg Config, poolIPv4s []net.IP) {
+	log.Printf("  IPv6 NIC : %s", cfg.IfaceIPv6)
+	log.Printf("  IPv4 NIC : %s", cfg.IfaceIPv4)
+	log.Printf("  RTP Ports: %d-%d", cfg.RTPPortStart, cfg.RTPPortEnd)
 
 	var gatewayIPv6 net.IP
-	if gwIPv6Str != "" {
-		gatewayIPv6 = net.ParseIP(gwIPv6Str)
+	if cfg.GwIPv6 != "" {
+		gatewayIPv6 = net.ParseIP(cfg.GwIPv6)
 		if gatewayIPv6 == nil {
-			log.Fatalf("无效的 IPv6 地址: %s", gwIPv6Str)
+			log.Fatalf("无效的 IPv6 地址: %s", cfg.GwIPv6)
 		}
 		log.Printf("  GW IPv6  : %s", gatewayIPv6)
 	}
 
+	// 解析网关 MAC 地址
+	var ipv4GwMAC, ipv6GwMAC net.HardwareAddr
+	if cfg.IPv4GatewayMAC != "" {
+		var err error
+		ipv4GwMAC, err = net.ParseMAC(cfg.IPv4GatewayMAC)
+		if err != nil {
+			log.Fatalf("无效的 IPv4 网关 MAC: %s (%v)", cfg.IPv4GatewayMAC, err)
+		}
+		log.Printf("  IPv4 GW MAC: %s", ipv4GwMAC)
+	} else {
+		log.Println("  ⚠️  未配置 ipv4_gateway_mac, 将使用广播 MAC (ff:ff:ff:ff:ff:ff)")
+		ipv4GwMAC, _ = net.ParseMAC("ff:ff:ff:ff:ff:ff")
+	}
+	if cfg.IPv6GatewayMAC != "" {
+		var err error
+		ipv6GwMAC, err = net.ParseMAC(cfg.IPv6GatewayMAC)
+		if err != nil {
+			log.Fatalf("无效的 IPv6 网关 MAC: %s (%v)", cfg.IPv6GatewayMAC, err)
+		}
+		log.Printf("  IPv6 GW MAC: %s", ipv6GwMAC)
+	} else {
+		log.Println("  ⚠️  未配置 ipv6_gateway_mac, 将从入站帧动态学习")
+	}
+
 	staticIPs := make(map[string]net.IP)
-	for ip6, ip4 := range staticMaps {
+	for ip6, ip4 := range cfg.StaticMaps {
 		parsed6 := net.ParseIP(ip6)
 		parsed4 := net.ParseIP(ip4).To4()
 		if parsed6 != nil && parsed4 != nil {
-			// key using the standard 16-byte representation for strict matching
 			staticIPs[parsed6.To16().String()] = parsed4
 		} else {
 			log.Printf("警告: 无效的静态映射配置 - [%s] -> [%s]", ip6, ip4)
@@ -138,12 +164,15 @@ func startDualMode(iface6, iface4 string, poolIPv4s []net.IP, gwIPv6Str string, 
 	}
 
 	config := engine.DualNICConfig{
-		IPv6Interface:  iface6,
-		IPv4Interface:  iface4,
+		IPv6Interface:  cfg.IfaceIPv6,
+		IPv4Interface:  cfg.IfaceIPv4,
 		PoolIPv4s:      poolIPv4s,
 		GatewayIPv6:    gatewayIPv6,
-		RTPPortStart:   rtpStart,
-		RTPPortEnd:     rtpEnd,
+		IPv4GatewayMAC: ipv4GwMAC,
+		IPv6GatewayMAC: ipv6GwMAC,
+		EnableARPProxy: cfg.EnableARPProxy,
+		RTPPortStart:   uint16(cfg.RTPPortStart),
+		RTPPortEnd:     uint16(cfg.RTPPortEnd),
 		StaticMappings: staticIPs,
 	}
 
