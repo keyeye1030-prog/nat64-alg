@@ -91,17 +91,27 @@ func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
 		config.RTPPortEnd = 30000
 	}
 
+	// 初始化 AF_XDP - IPv6 侧
+	program6, xsk6, err := setupXDPSocket(eth6, "IPv6")
+	if err != nil {
+		return nil, err
+	}
+
+	// 初始化 AF_XDP - IPv4 侧
+	program4, xsk4, err := setupXDPSocket(eth4, "IPv4")
+	if err != nil {
+		cleanupXDP(program6, xsk6, eth6)
+		return nil, err
+	}
+
 	// 初始化 NAT64 核心
 	sessionTable := nat64.NewSessionTable(config.PoolIPv4s, 10000, 60000, config.SessionTTL)
 	if config.StaticMappings != nil {
 		sessionTable.SetStaticMappings(config.StaticMappings)
 	}
-	// translator just needs the session table, but wait, translator also holds PoolIPv4 for some checks?
-	// Actually we should see what NewTranslator needs. We'll pass the first IP or modify Translator too.
 	translator := nat64.NewTranslator(config.PoolIPv4s[0], sessionTable)
 
 	// 初始化 RTP 中继
-	// RTP 中继绑定地址现在是动态协商的, pool 也可以传第一个或者不传
 	relayMgr := rtp.NewRelayManager(
 		config.GatewayIPv6,
 		config.PoolIPv4s[0],
@@ -111,7 +121,11 @@ func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
 
 	engine := &DualNICEngine{
 		iface6Name:   config.IPv6Interface,
+		program6:     program6,
+		xsk6:         xsk6,
 		iface4Name:   config.IPv4Interface,
+		program4:     program4,
+		xsk4:         xsk4,
 		translator:   translator,
 		relayManager: relayMgr,
 		config:       config,
@@ -121,12 +135,53 @@ func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
 	go engine.sessionCleaner(sessionTable)
 
 	log.Printf("[DualNIC] 引擎初始化完成")
-	log.Printf("  IPv6 侧: %s", config.IPv6Interface)
-	log.Printf("  IPv4 侧: %s", config.IPv4Interface)
+	log.Printf("  IPv6 侧: %s (XDP FD=%d)", config.IPv6Interface, xsk6.FD())
+	log.Printf("  IPv4 侧: %s (XDP FD=%d)", config.IPv4Interface, xsk4.FD())
 	log.Printf("  Pool IPv4: %d addresses", len(config.PoolIPv4s))
 	log.Printf("  RTP 端口: %d-%d", config.RTPPortStart, config.RTPPortEnd)
 
 	return engine, nil
+}
+
+// setupXDPSocket 为指定网卡创建 XDP 程序和 AF_XDP socket
+func setupXDPSocket(iface *net.Interface, label string) (*xdp.Program, *xdp.Socket, error) {
+	program, err := xdp.NewProgram(1)
+	if err != nil {
+		return nil, nil, fmt.Errorf("[%s] 创建 XDP 程序失败: %w", label, err)
+	}
+
+	if err := program.Attach(iface.Index); err != nil {
+		program.Close()
+		return nil, nil, fmt.Errorf("[%s] 附着 XDP 程序到 %s 失败: %w", label, iface.Name, err)
+	}
+
+	xsk, err := xdp.NewSocket(iface.Index, 0, nil)
+	if err != nil {
+		program.Detach(iface.Index)
+		program.Close()
+		return nil, nil, fmt.Errorf("[%s] 创建 AF_XDP socket 失败: %w", label, err)
+	}
+
+	if err := program.Register(0, xsk.FD()); err != nil {
+		xsk.Close()
+		program.Detach(iface.Index)
+		program.Close()
+		return nil, nil, fmt.Errorf("[%s] 注册 AF_XDP socket 失败: %w", label, err)
+	}
+
+	log.Printf("[DualNIC-%s] AF_XDP socket 就绪 (FD=%d)", label, xsk.FD())
+	return program, xsk, nil
+}
+
+// cleanupXDP 清理 XDP 资源
+func cleanupXDP(program *xdp.Program, xsk *xdp.Socket, iface *net.Interface) {
+	if xsk != nil {
+		xsk.Close()
+	}
+	if program != nil {
+		program.Detach(iface.Index)
+		program.Close()
+	}
 }
 
 // Start 启动双向数据包处理循环
@@ -144,37 +199,99 @@ func (e *DualNICEngine) Start() {
 // pollIPv6Side 轮询 IPv6 侧网卡, 处理 6→4 方向
 func (e *DualNICEngine) pollIPv6Side() {
 	log.Printf("[DualNIC] IPv6 侧 (%s) 轮询已启动", e.iface6Name)
+	fillXSKRing(e.xsk6)
 
-	// TODO: 真实实现中从 xsk6 的 RX ring 读取
-	// for {
-	//     n := e.xsk6.NumReceived()
-	//     if n > 0 {
-	//         rxDescs := e.xsk6.Receive(n)
-	//         for _, desc := range rxDescs {
-	//             frame := e.xsk6.GetFrame(desc)
-	//             e.processIPv6Frame(frame)
-	//         }
-	//     }
-	//     e.xsk6.Poll(-1)
-	// }
+	for {
+		_, _, err := e.xsk6.Poll(-1)
+		if err != nil {
+			log.Printf("[DualNIC-IPv6] Poll 错误: %v", err)
+			continue
+		}
+
+		numRx := e.xsk6.NumReceived()
+		if numRx > 0 {
+			rxDescs := e.xsk6.Receive(numRx)
+			for i := range rxDescs {
+				frame := e.xsk6.GetFrame(rxDescs[i])
+				frameLen := int(rxDescs[i].Len)
+				if frameLen == 0 || frameLen > len(frame) {
+					continue
+				}
+				frameCopy := make([]byte, frameLen)
+				copy(frameCopy, frame[:frameLen])
+				e.processIPv6Frame(frameCopy)
+			}
+			fillXSKRing(e.xsk6)
+		}
+
+		numComp := e.xsk6.NumCompleted()
+		if numComp > 0 {
+			e.xsk6.Complete(numComp)
+		}
+	}
 }
 
 // pollIPv4Side 轮询 IPv4 侧网卡, 处理 4→6 方向
 func (e *DualNICEngine) pollIPv4Side() {
 	log.Printf("[DualNIC] IPv4 侧 (%s) 轮询已启动", e.iface4Name)
+	fillXSKRing(e.xsk4)
 
-	// TODO: 真实实现中从 xsk4 的 RX ring 读取
-	// for {
-	//     n := e.xsk4.NumReceived()
-	//     if n > 0 {
-	//         rxDescs := e.xsk4.Receive(n)
-	//         for _, desc := range rxDescs {
-	//             frame := e.xsk4.GetFrame(desc)
-	//             e.processIPv4Frame(frame)
-	//         }
-	//     }
-	//     e.xsk4.Poll(-1)
-	// }
+	for {
+		_, _, err := e.xsk4.Poll(-1)
+		if err != nil {
+			log.Printf("[DualNIC-IPv4] Poll 错误: %v", err)
+			continue
+		}
+
+		numRx := e.xsk4.NumReceived()
+		if numRx > 0 {
+			rxDescs := e.xsk4.Receive(numRx)
+			for i := range rxDescs {
+				frame := e.xsk4.GetFrame(rxDescs[i])
+				frameLen := int(rxDescs[i].Len)
+				if frameLen == 0 || frameLen > len(frame) {
+					continue
+				}
+				frameCopy := make([]byte, frameLen)
+				copy(frameCopy, frame[:frameLen])
+				e.processIPv4Frame(frameCopy)
+			}
+			fillXSKRing(e.xsk4)
+		}
+
+		numComp := e.xsk4.NumCompleted()
+		if numComp > 0 {
+			e.xsk4.Complete(numComp)
+		}
+	}
+}
+
+// fillXSKRing 将可用描述符填入 XSK 的 Fill Ring
+func fillXSKRing(xsk *xdp.Socket) {
+	n := xsk.NumFreeFillSlots()
+	if n == 0 {
+		return
+	}
+	descs := xsk.GetDescs(n)
+	for i := range descs {
+		descs[i].Len = 0
+	}
+	xsk.Fill(descs)
+}
+
+// sendToXSK 将帧写入指定 XSK 的 TX 队列
+func sendToXSK(xsk *xdp.Socket, frame []byte) {
+	if xsk.NumFreeTxSlots() < 1 {
+		return
+	}
+	descs := xsk.GetDescs(1)
+	if len(descs) < 1 {
+		return
+	}
+	txFrame := xsk.GetFrame(descs[0])
+	n := copy(txFrame, frame)
+	descs[0].Len = uint32(n)
+	xsk.Transmit(descs)
 }
 
 // processIPv6Frame 处理从 IPv6 侧收到的帧
@@ -182,17 +299,15 @@ func (e *DualNICEngine) processIPv6Frame(frame []byte) {
 	result := e.translator.ProcessFrame(frame)
 
 	if result.Error != nil {
-		log.Printf("[DualNIC-6to4] %v", result.Error)
 		return
 	}
 
 	switch result.Direction {
 	case nat64.Dir6to4:
 		// 翻译后的 IPv4 帧从 IPv4 侧网卡发出
-		e.sendToIPv4Side(result.OutputFrame)
+		sendToXSK(e.xsk4, result.OutputFrame)
 	case nat64.DirPassthrough:
-		// 非 NAT64 流量: 放行回 IPv6 侧内核协议栈
-		// XDP_PASS
+		// 非 NAT64 流量: 放行 (在 XDP 层已放行给内核, 此处不需额外处理)
 	}
 }
 
@@ -201,52 +316,48 @@ func (e *DualNICEngine) processIPv4Frame(frame []byte) {
 	result := e.translator.ProcessFrame(frame)
 
 	if result.Error != nil {
-		log.Printf("[DualNIC-4to6] %v", result.Error)
 		return
 	}
 
 	switch result.Direction {
 	case nat64.Dir4to6:
 		// 翻译后的 IPv6 帧从 IPv6 侧网卡发出
-		e.sendToIPv6Side(result.OutputFrame)
+		sendToXSK(e.xsk6, result.OutputFrame)
 	case nat64.DirPassthrough:
-		// 非 NAT64 流量: 放行回 IPv4 侧内核协议栈
+		// 非 NAT64 流量: 放行
 	}
-}
-
-// sendToIPv4Side 将帧写入 IPv4 侧网卡的 TX 队列
-func (e *DualNICEngine) sendToIPv4Side(frame []byte) {
-	// TODO: 真实实现中调用 e.xsk4 的 TX 接口
-	// desc := e.xsk4.GetFreeTxDesc()
-	// copy(e.xsk4.GetFrame(desc), frame)
-	// e.xsk4.Transmit(desc)
-	_ = frame
-}
-
-// sendToIPv6Side 将帧写入 IPv6 侧网卡的 TX 队列
-func (e *DualNICEngine) sendToIPv6Side(frame []byte) {
-	// TODO: 真实实现中调用 e.xsk6 的 TX 接口
-	_ = frame
 }
 
 // Close 释放所有资源
 func (e *DualNICEngine) Close() {
+	// IPv6 侧
 	if e.xsk6 != nil {
 		e.xsk6.Close()
 	}
+	if e.program6 != nil {
+		iface6, err := net.InterfaceByName(e.iface6Name)
+		if err == nil {
+			e.program6.Detach(iface6.Index)
+		}
+		e.program6.Close()
+	}
+
+	// IPv4 侧
 	if e.xsk4 != nil {
 		e.xsk4.Close()
 	}
-	if e.program6 != nil {
-		e.program6.Close()
-	}
 	if e.program4 != nil {
+		iface4, err := net.InterfaceByName(e.iface4Name)
+		if err == nil {
+			e.program4.Detach(iface4.Index)
+		}
 		e.program4.Close()
 	}
 
 	active, relayed := e.relayManager.Stats()
-	log.Printf("[DualNIC] 关闭. 活跃会话: %d, RTP 中继: %d (累计转发: %d 包)",
-		e.translator.SessionTable.Stats(), active, relayed)
+	log.Printf("[DualNIC] 关闭. 统计: 6→4=%d, 4→6=%d, 丢弃=%d, RTP中继=%d (累计转发=%d包)",
+		e.translator.Pkts6to4, e.translator.Pkts4to6,
+		e.translator.PktsDropped, active, relayed)
 }
 
 // GetTranslator 暴露翻译器供外部使用
@@ -265,8 +376,8 @@ func (e *DualNICEngine) sessionCleaner(table *nat64.SessionTable) {
 	defer ticker.Stop()
 	for range ticker.C {
 		cleaned := table.CleanExpired()
+		active, _ := e.relayManager.Stats()
 		if cleaned > 0 {
-			active, _ := e.relayManager.Stats()
 			log.Printf("[SessionCleaner] 清除 %d 条过期会话, 剩余: %d, RTP 中继: %d",
 				cleaned, table.Stats(), active)
 		}

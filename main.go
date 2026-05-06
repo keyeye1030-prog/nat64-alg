@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -55,7 +54,7 @@ func main() {
 	}
 
 	if cfgPath != "" {
-		data, err := ioutil.ReadFile(cfgPath)
+		data, err := os.ReadFile(cfgPath)
 		if err != nil {
 			log.Fatalf("无法读取配置文件: %v", err)
 		}

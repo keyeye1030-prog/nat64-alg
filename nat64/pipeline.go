@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync/atomic"
 )
 
 // ============================================================================
@@ -24,6 +25,13 @@ type Translator struct {
 	SessionTable *SessionTable
 	PoolIPv4     net.IP // NAT64 网关的 IPv4 出口地址
 	ALG          *ALGHandler // SIP/H.323 应用层网关
+	DebugLog     bool   // 是否输出每包调试日志
+
+	// 统计计数器 (原子操作)
+	Pkts6to4     uint64
+	Pkts4to6     uint64
+	PktsDropped  uint64
+	PktsPassthru uint64
 }
 
 // NewTranslator 创建 NAT64 翻译器实例
@@ -84,18 +92,37 @@ func (t *Translator) process6to4(dstMAC, srcMAC, ipv6Raw []byte) *ProcessResult 
 	// 提取 IPv6 地址
 	srcIPv6 := net.IP(ipv6Raw[8:24]).To16()
 	dstIPv6 := net.IP(ipv6Raw[24:40]).To16()
-	nextHeader := ipv6Raw[6]
 
 	// 检查目的地址是否在 NAT64 前缀内
 	dstIPv4 := IPv6ExtractIPv4(dstIPv6)
 	if dstIPv4 == nil {
-		// 不是发往 NAT64 前缀的包, 放行
+		atomic.AddUint64(&t.PktsPassthru, 1)
 		return &ProcessResult{Direction: DirPassthrough}
 	}
 
-	// 获取传输层端口 (用于会话表)
-	srcPort, dstPort, proto, err := extractTransportInfo6(ipv6Raw)
+	// 解析扩展头链, 获取真实传输层协议
+	parsed, err := ParseIPv6ExtensionHeaders(ipv6Raw)
 	if err != nil {
+		atomic.AddUint64(&t.PktsDropped, 1)
+		return &ProcessResult{Error: fmt.Errorf("解析扩展头失败: %w", err)}
+	}
+
+	// 后续分片无传输层头, 只做 IP 层翻译, 不查会话表
+	if parsed.IsSubsequentFragment() {
+		resultPayload, err := TranslateIPv6ToIPv4WithFragments(ipv6Raw, t.PoolIPv4, dstIPv4)
+		if err != nil {
+			atomic.AddUint64(&t.PktsDropped, 1)
+			return &ProcessResult{Error: fmt.Errorf("6->4 分片翻译失败: %w", err)}
+		}
+		outputFrame := makeEtherFrame(srcMAC, dstMAC, EtherTypeIPv4, resultPayload)
+		atomic.AddUint64(&t.Pkts6to4, 1)
+		return &ProcessResult{OutputFrame: outputFrame, Direction: Dir6to4}
+	}
+
+	// 获取传输层端口 (使用扩展头解析结果)
+	srcPort, dstPort, proto, err := extractTransportInfo6WithParsed(ipv6Raw, parsed)
+	if err != nil {
+		atomic.AddUint64(&t.PktsDropped, 1)
 		return &ProcessResult{Error: err}
 	}
 
@@ -110,25 +137,23 @@ func (t *Translator) process6to4(dstMAC, srcMAC, ipv6Raw []byte) *ProcessResult 
 
 	sess, err := t.SessionTable.Lookup6to4(key6)
 	if err != nil {
+		atomic.AddUint64(&t.PktsDropped, 1)
 		return &ProcessResult{Error: fmt.Errorf("查找会话失败: %w", err)}
 	}
 
 	// ---- 执行 IP 头部翻译 ----
 	var resultPayload []byte
+	transportProto := parsed.TransportProto
 
-	if nextHeader == ProtoNumICMPv6 {
-		// ICMP 特殊处理: 需要做类型/代码转换
+	if transportProto == ProtoNumICMPv6 {
 		resultPayload, err = t.translateICMPv6Packet(ipv6Raw, sess)
 	} else {
-		// TCP/UDP: IP 头转换 + 端口 NAT
-		resultPayload, err = TranslateIPv6ToIPv4(ipv6Raw, t.PoolIPv4, dstIPv4)
+		// TCP/UDP: 使用分片感知的翻译
+		resultPayload, err = TranslateIPv6ToIPv4WithFragments(ipv6Raw, t.PoolIPv4, dstIPv4)
 		if err == nil {
-			// 写入 NAT 映射后的源端口
 			patchSrcPort(resultPayload[IPv4HeaderMinLen:], sess.Key4.SrcPort)
-			// 重算传输层校验和 (端口变了)
 			recalcTransportChecksum4(resultPayload, resultPayload[9])
 
-			// ALG 处理: 如果是 SIP/H.323 端口, 修改应用层载荷
 			if NeedsALG(srcPort, dstPort) {
 				resultPayload, _ = t.ALG.ProcessALG6to4(resultPayload, sess)
 			}
@@ -136,14 +161,17 @@ func (t *Translator) process6to4(dstMAC, srcMAC, ipv6Raw []byte) *ProcessResult 
 	}
 
 	if err != nil {
+		atomic.AddUint64(&t.PktsDropped, 1)
 		return &ProcessResult{Error: fmt.Errorf("6->4 翻译失败: %w", err)}
 	}
 
-	// 组装以太帧 (交换 MAC)
 	outputFrame := makeEtherFrame(srcMAC, dstMAC, EtherTypeIPv4, resultPayload)
+	atomic.AddUint64(&t.Pkts6to4, 1)
 
-	log.Printf("[NAT64 6->4] %s:%d -> %s:%d (mapped port: %d)",
-		srcIPv6, srcPort, dstIPv4, dstPort, sess.Key4.SrcPort)
+	if t.DebugLog {
+		log.Printf("[NAT64 6->4] %s:%d -> %s:%d (mapped port: %d)",
+			srcIPv6, srcPort, dstIPv4, dstPort, sess.Key4.SrcPort)
+	}
 
 	return &ProcessResult{OutputFrame: outputFrame, Direction: Dir6to4}
 }
@@ -162,24 +190,34 @@ func (t *Translator) process4to6(dstMAC, srcMAC, ipv4Raw []byte) *ProcessResult 
 
 	// 检查目的 IP 是否是我们的 NAT64 池地址或静态映射地址
 	if !t.SessionTable.IsPoolIP(dstIPv4) {
+		atomic.AddUint64(&t.PktsPassthru, 1)
 		return &ProcessResult{Direction: DirPassthrough}
+	}
+
+	// 检查是否是后续分片 (offset>0, 无传输层头)
+	fragInfo, _ := ParseIPv4FragmentInfo(ipv4Raw)
+	if fragInfo != nil && fragInfo.IsFragment && fragInfo.FragmentOffset > 0 {
+		// 后续分片: 只做 IP 层翻译, 无法查会话表
+		// TODO: 实现分片跟踪表, 关联后续分片到第一个分片的会话
+		atomic.AddUint64(&t.PktsDropped, 1)
+		return &ProcessResult{Error: fmt.Errorf("4->6 后续分片暂不支持 (需分片跟踪表)")}
 	}
 
 	// 提取传输层端口
 	srcPort, dstPort, proto, err := extractTransportInfo4(ipv4Raw, ihl)
 	if err != nil {
+		atomic.AddUint64(&t.PktsDropped, 1)
 		return &ProcessResult{Error: err}
 	}
 
 	// 查找反向会话
-	// 回包: srcIP=远端服务器, srcPort=远端端口, dstIP=我们(pool或static), dstPort=mappedPort
 	sess, ok := t.SessionTable.LookupByMappedPort(dstIPv4, srcIPv4, srcPort, dstPort, proto)
 	if !ok {
+		atomic.AddUint64(&t.PktsDropped, 1)
 		return &ProcessResult{Error: fmt.Errorf("找不到反向会话: %s:%d -> %s:%d",
 			srcIPv4, srcPort, dstIPv4, dstPort)}
 	}
 
-	// 恢复原始 IPv6 地址
 	origSrcIPv6 := net.IP(sess.Key6.SrcIP[:]).To16()
 
 	// ---- 执行 IP 头部翻译 ----
@@ -188,15 +226,25 @@ func (t *Translator) process4to6(dstMAC, srcMAC, ipv4Raw []byte) *ProcessResult 
 	if protocol == ProtoNumICMPv4 {
 		resultPayload, err = t.translateICMPv4Packet(ipv4Raw, sess)
 	} else {
-		// srcIPv6 = NAT64 合成地址 (对方 IPv4 嵌入), dstIPv6 = 原始 IPv6 客户端
 		synthSrcIPv6 := IPv4ToIPv6(srcIPv4)
-		resultPayload, err = TranslateIPv4ToIPv6(ipv4Raw, synthSrcIPv6, origSrcIPv6)
+		// 使用分片感知的翻译
+		resultPayload, err = TranslateIPv4ToIPv6WithFragments(ipv4Raw, synthSrcIPv6, origSrcIPv6)
 		if err == nil {
-			// 恢复原始目的端口
-			patchDstPort(resultPayload[IPv6HeaderLen:], sess.Key6.SrcPort)
-			recalcTransportChecksum6(resultPayload, resultPayload[6])
+			// 恢复原始目的端口 (需要找到传输层头的正确偏移)
+			transportOff := IPv6HeaderLen
+			if fragInfo != nil && fragInfo.IsFragment {
+				transportOff += FragmentHdrLen // 跳过 Fragment Header
+			}
+			patchDstPort(resultPayload[transportOff:], sess.Key6.SrcPort)
+			// 重算校验和
+			nextHdr := resultPayload[6]
+			if nextHdr == ExtHdrFragment {
+				nextHdr = resultPayload[IPv6HeaderLen] // Fragment Header 的 Next Header
+				recalcTransportChecksum6WithOffset(resultPayload, nextHdr, transportOff)
+			} else {
+				recalcTransportChecksum6(resultPayload, nextHdr)
+			}
 
-			// ALG 处理: 如果是 SIP/H.323 端口, 修改应用层载荷
 			if NeedsALG(srcPort, dstPort) {
 				resultPayload, _ = t.ALG.ProcessALG4to6(resultPayload, sess)
 			}
@@ -204,13 +252,17 @@ func (t *Translator) process4to6(dstMAC, srcMAC, ipv4Raw []byte) *ProcessResult 
 	}
 
 	if err != nil {
+		atomic.AddUint64(&t.PktsDropped, 1)
 		return &ProcessResult{Error: fmt.Errorf("4->6 翻译失败: %w", err)}
 	}
 
 	outputFrame := makeEtherFrame(srcMAC, dstMAC, EtherTypeIPv6, resultPayload)
+	atomic.AddUint64(&t.Pkts4to6, 1)
 
-	log.Printf("[NAT64 4->6] %s:%d -> %s (restored to %s:%d)",
-		srcIPv4, srcPort, dstIPv4, origSrcIPv6, sess.Key6.SrcPort)
+	if t.DebugLog {
+		log.Printf("[NAT64 4->6] %s:%d -> %s (restored to %s:%d)",
+			srcIPv4, srcPort, dstIPv4, origSrcIPv6, sess.Key6.SrcPort)
+	}
 
 	return &ProcessResult{OutputFrame: outputFrame, Direction: Dir4to6}
 }
@@ -294,11 +346,29 @@ func (t *Translator) translateICMPv4Packet(ipv4Raw []byte, sess *Session) ([]byt
 
 // ---------- 辅助函数 ----------
 
-// extractTransportInfo6 从 IPv6 包中提取传输层信息
+// extractTransportInfo6 从 IPv6 包中提取传输层信息 (不处理扩展头, 兼容旧调用)
 func extractTransportInfo6(ipv6Raw []byte) (srcPort, dstPort uint16, proto Protocol, err error) {
-	nextHeader := ipv6Raw[6]
-	payload := ipv6Raw[IPv6HeaderLen:]
+	parsed, parseErr := ParseIPv6ExtensionHeaders(ipv6Raw)
+	if parseErr != nil {
+		// 降级: 使用基本头的 Next Header
+		nextHeader := ipv6Raw[6]
+		payload := ipv6Raw[IPv6HeaderLen:]
+		return extractFromPayload6(nextHeader, payload)
+	}
+	return extractTransportInfo6WithParsed(ipv6Raw, parsed)
+}
 
+// extractTransportInfo6WithParsed 使用已解析的扩展头信息提取传输层信息
+func extractTransportInfo6WithParsed(ipv6Raw []byte, parsed *IPv6ParsedHeaders) (srcPort, dstPort uint16, proto Protocol, err error) {
+	if parsed.TransportOffset >= len(ipv6Raw) {
+		return 0, 0, 0, fmt.Errorf("传输层偏移越界: %d >= %d", parsed.TransportOffset, len(ipv6Raw))
+	}
+	payload := ipv6Raw[parsed.TransportOffset:]
+	return extractFromPayload6(parsed.TransportProto, payload)
+}
+
+// extractFromPayload6 从传输层载荷中提取端口信息
+func extractFromPayload6(nextHeader uint8, payload []byte) (srcPort, dstPort uint16, proto Protocol, err error) {
 	switch nextHeader {
 	case ProtoNumTCPNum, ProtoNumUDPNum:
 		if len(payload) < 4 {
@@ -317,9 +387,8 @@ func extractTransportInfo6(ipv6Raw []byte) (srcPort, dstPort uint16, proto Proto
 		}
 		proto = ProtoICMP
 		icmpType := payload[0]
-		// 对于 Echo Request/Reply, 使用 Identifier 作为 "端口"
 		if icmpType == ICMPv6EchoRequest || icmpType == ICMPv6EchoReply {
-			srcPort = binary.BigEndian.Uint16(payload[4:6]) // Identifier
+			srcPort = binary.BigEndian.Uint16(payload[4:6])
 			dstPort = 0
 		}
 	default:

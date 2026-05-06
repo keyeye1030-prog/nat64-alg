@@ -35,6 +35,8 @@ func (e *XDPEngine) Start() {
 }
 
 func (e *XDPEngine) Close() {
+	log.Printf("[XDPEngine-Stub] 统计: 6→4=%d, 4→6=%d, 丢弃=%d",
+		e.translator.Pkts6to4, e.translator.Pkts4to6, e.translator.PktsDropped)
 	log.Println("[XDPEngine-Stub] 桩替服务关闭。")
 }
 
