@@ -26,9 +26,11 @@ type ALGHandler struct {
 
 // NewALGHandler 创建 ALG 处理器 (无 RTP 中继, 单臂模式)
 func NewALGHandler(poolIPv4 net.IP) *ALGHandler {
+	h323Trans := h323.NewTranslator(poolIPv4)
+	h323Trans.NAT64Prefix = WellKnownPrefix
 	return &ALGHandler{
 		sipTranslator:  sip.NewTranslator(poolIPv4),
-		h323Translator: h323.NewTranslator(poolIPv4),
+		h323Translator: h323Trans,
 	}
 }
 

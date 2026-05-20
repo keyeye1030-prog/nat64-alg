@@ -10,15 +10,18 @@ import (
 	"syscall"
 
 	"nat64-alg/engine"
+	"nat64-alg/nat64"
 )
 
 type Config struct {
 	Mode           string   `json:"mode"`
 	PoolIPv4s      []string `json:"pool_ipv4s"`
+	NAT64Prefix    string   `json:"nat64_prefix"`     // 自定义 NAT64 前缀
 	Interface      string   `json:"interface"`        // 单臂模式下使用的网卡
 	IfaceIPv6      string   `json:"iface_ipv6"`       // 双臂模式 IPv6侧网卡
 	IfaceIPv4      string   `json:"iface_ipv4"`       // 双臂模式 IPv4侧网卡
 	GwIPv6         string   `json:"gw_ipv6"`          // 网关IPv6地址
+	IPv6Gateway    string   `json:"ipv6_gateway"`     // IPv6 默认网关地址
 	IPv4GatewayMAC string   `json:"ipv4_gateway_mac"` // IPv4 侧网关 MAC 地址
 	IPv6GatewayMAC string   `json:"ipv6_gateway_mac"` // IPv6 侧网关 MAC 地址
 	EnableARPProxy bool     `json:"enable_arp_proxy"` // 是否开启 ARP 代理
@@ -34,10 +37,12 @@ func main() {
 	// Default CLI flags
 	mode := flag.String("mode", "single", "部署模式: single (单臂) 或 dual (双臂双网卡)")
 	poolIP := flag.String("pool-ipv4", "198.51.100.1", "NAT64 网关的 IPv4 出口地址")
+	nat64Prefix := flag.String("nat64-prefix", "", "自定义 NAT64 IPv6 前缀 (例如 240C:C0A9:100F:1::/96)")
 	iface := flag.String("interface", "eth0", "[单臂模式] 网卡名称")
 	iface6 := flag.String("iface-ipv6", "eth0", "[双臂模式] IPv6 侧网卡名称")
 	iface4 := flag.String("iface-ipv4", "eth1", "[双臂模式] IPv4 侧网卡名称")
 	gwIPv6 := flag.String("gw-ipv6", "", "[双臂模式] 网关 IPv6 地址 (用于 RTP 中继绑定)")
+	ipv6Gateway := flag.String("ipv6-gateway", "", "[双臂模式] IPv6 默认网关地址 (如 1111::1)")
 	rtpStart := flag.Uint("rtp-port-start", 20000, "[双臂模式] RTP 中继端口起始")
 	rtpEnd := flag.Uint("rtp-port-end", 30000, "[双臂模式] RTP 中继端口结束")
 
@@ -45,10 +50,12 @@ func main() {
 
 	cfg := Config{
 		Mode:         *mode,
+		NAT64Prefix:  *nat64Prefix,
 		Interface:    *iface,
 		IfaceIPv6:    *iface6,
 		IfaceIPv4:    *iface4,
 		GwIPv6:       *gwIPv6,
+		IPv6Gateway:  *ipv6Gateway,
 		RTPPortStart: *rtpStart,
 		RTPPortEnd:   *rtpEnd,
 	}
@@ -56,6 +63,7 @@ func main() {
 		cfg.PoolIPv4s = []string{*poolIP}
 	}
 
+	// 提前引入 nat64 包来进行前缀设置
 	if cfgPath != "" {
 		data, err := os.ReadFile(cfgPath)
 		if err != nil {
@@ -65,6 +73,23 @@ func main() {
 			log.Fatalf("无法解析配置文件: %v", err)
 		}
 		log.Printf("Loaded configuration from %s", cfgPath)
+	}
+
+	// 设置自定义 NAT64 前缀
+	if cfg.NAT64Prefix != "" {
+		ip, _, err := net.ParseCIDR(cfg.NAT64Prefix)
+		if err != nil {
+			ip = net.ParseIP(cfg.NAT64Prefix)
+			if ip == nil {
+				log.Fatalf("无效的 NAT64 前缀: %s", cfg.NAT64Prefix)
+			}
+		}
+		// 动态导入 nat64 包
+		var _ = nat64.WellKnownPrefix
+		nat64.SetNAT64Prefix(ip)
+		log.Printf("  NAT64 Prefix: %s (Embeds IPv4 in last 32 bits)", ip)
+	} else {
+		log.Printf("  NAT64 Prefix: %s (Standard Well-Known Prefix)", nat64.WellKnownPrefix)
 	}
 
 	var poolIPv4s []net.IP
@@ -125,6 +150,15 @@ func startDualMode(cfg Config, poolIPv4s []net.IP) {
 		log.Printf("  GW IPv6  : %s", gatewayIPv6)
 	}
 
+	var ipv6Gateway net.IP
+	if cfg.IPv6Gateway != "" {
+		ipv6Gateway = net.ParseIP(cfg.IPv6Gateway)
+		if ipv6Gateway == nil {
+			log.Fatalf("无效的 IPv6 默认网关地址: %s", cfg.IPv6Gateway)
+		}
+		log.Printf("  IPv6 Gateway IP: %s", ipv6Gateway)
+	}
+
 	// 解析网关 MAC 地址
 	var ipv4GwMAC, ipv6GwMAC net.HardwareAddr
 	if cfg.IPv4GatewayMAC != "" {
@@ -146,7 +180,7 @@ func startDualMode(cfg Config, poolIPv4s []net.IP) {
 		}
 		log.Printf("  IPv6 GW MAC: %s", ipv6GwMAC)
 	} else {
-		log.Println("  ⚠️  未配置 ipv6_gateway_mac, 将从入站帧动态学习")
+		log.Println("  ⚠️  未配置 ipv6_gateway_mac, 将尝试从系统邻居表自动获取或从首包动态学习")
 	}
 
 	staticIPs := make(map[string]net.IP)
@@ -168,6 +202,7 @@ func startDualMode(cfg Config, poolIPv4s []net.IP) {
 		IPv4Interface:  cfg.IfaceIPv4,
 		PoolIPv4s:      poolIPv4s,
 		GatewayIPv6:    gatewayIPv6,
+		IPv6Gateway:    ipv6Gateway,
 		IPv4GatewayMAC: ipv4GwMAC,
 		IPv6GatewayMAC: ipv6GwMAC,
 		EnableARPProxy: cfg.EnableARPProxy,

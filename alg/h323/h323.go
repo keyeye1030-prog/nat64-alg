@@ -44,13 +44,15 @@ type MediaPort struct {
 
 // Translator 是 H.323 ALG 翻译器
 type Translator struct {
-	PoolIPv4 net.IP
+	PoolIPv4    net.IP
+	NAT64Prefix net.IP
 }
 
 // NewTranslator 创建 H.323 ALG 翻译器
 func NewTranslator(poolIPv4 net.IP) *Translator {
 	return &Translator{
-		PoolIPv4: poolIPv4.To4(),
+		PoolIPv4:    poolIPv4.To4(),
+		NAT64Prefix: net.IP{0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, // 默认 well-known 前缀
 	}
 }
 
@@ -146,7 +148,7 @@ type TransportAddress struct {
 
 // ScanTransportAddresses 在二进制载荷中搜索所有可能的 TransportAddress
 // 使用启发式模式匹配: 搜索连续的 4 或 16 字节 IP + 2 字节合法端口
-func ScanTransportAddresses(data []byte) []TransportAddress {
+func ScanTransportAddresses(data []byte, prefix net.IP) []TransportAddress {
 	var results []TransportAddress
 
 	// 搜索 IPv6 TransportAddress 模式 (18 bytes: 16 IP + 2 Port)
@@ -155,7 +157,7 @@ func ScanTransportAddresses(data []byte) []TransportAddress {
 		port := binary.BigEndian.Uint16(data[i+16 : i+18])
 
 		// 启发式验证: IPv6 地址看起来有效且端口在合理范围内
-		if isPlausibleIPv6(ip6) && port > 0 && port < 65535 {
+		if isPlausibleIPv6(ip6, prefix) && port > 0 && port < 65535 {
 			results = append(results, TransportAddress{
 				IsIPv6: true,
 				IP:     make(net.IP, 16),
@@ -230,7 +232,7 @@ func (t *Translator) TranslateIPv6ToIPv4(payload []byte, clientIPv6, mappedIPv4 
 	}
 	copy(result.ModifiedPayload, payload)
 
-	addrs := ScanTransportAddresses(payload)
+	addrs := ScanTransportAddresses(payload, t.NAT64Prefix)
 
 	for _, addr := range addrs {
 		if !addr.IsIPv6 {
@@ -270,7 +272,7 @@ func (t *Translator) TranslateIPv4ToIPv6(payload []byte, serverIPv4, clientIPv6 
 	}
 	copy(result.ModifiedPayload, payload)
 
-	addrs := ScanTransportAddresses(payload)
+	addrs := ScanTransportAddresses(payload, t.NAT64Prefix)
 
 	for _, addr := range addrs {
 		if addr.IsIPv6 {
@@ -420,7 +422,7 @@ func (t *Translator) ProcessH225Message(data []byte, clientIPv6, mappedIPv4 net.
 // ============================================================================
 
 // isPlausibleIPv6 使用启发式判断一段字节是否可能是有效的 IPv6 地址
-func isPlausibleIPv6(ip net.IP) bool {
+func isPlausibleIPv6(ip net.IP, prefix net.IP) bool {
 	if len(ip) != 16 {
 		return false
 	}
@@ -440,12 +442,25 @@ func isPlausibleIPv6(ip net.IP) bool {
 	}
 
 	// 检查是否以已知的 IPv6 前缀开头
-	// 2000::/3 (Global Unicast) 或 fe80::/10 (Link Local) 或 64:ff9b::/96 (NAT64)
+	// 2000::/3 (Global Unicast) 或 fe80::/10 (Link Local) 或自定义 NAT64 前缀
 	firstByte := ip[0]
 	if (firstByte&0xE0) == 0x20 || // 2000::/3
-		(firstByte == 0xFE && (ip[1]&0xC0) == 0x80) || // fe80::/10
-		(ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xFF && ip[3] == 0x9B) { // 64:ff9b::
+		(firstByte == 0xFE && (ip[1]&0xC0) == 0x80) { // fe80::/10
 		return true
+	}
+
+	// 检查是否匹配自定义的 NAT64 前缀 (第一段 12 字节 / 96 bits)
+	if len(prefix) == 16 {
+		matched := true
+		for i := 0; i < 12; i++ {
+			if ip[i] != prefix[i] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
 	}
 
 	return false

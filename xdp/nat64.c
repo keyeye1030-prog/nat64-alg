@@ -30,6 +30,18 @@ struct {
 } xsks_map SEC(".maps");
 
 /*
+ * NAT64 Dynamic Prefix Map: 动态设置自定义 IPv6 前缀 (第 1-3 个 32位块)
+ * Key = 0 (__u32)
+ * Value = __u32[4] (16 bytes, 网络字节序)
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32[4]);
+} prefix_map SEC(".maps");
+
+/*
  * Pool IPv4 Address Map: 存储所有 NAT64 出口地址 (动态池 + 静态映射)
  * Key = IPv4 地址 (网络字节序 __u32)
  * Value = 1 (仅标记存在)
@@ -44,6 +56,18 @@ struct {
 	__type(key, __u32);
 	__type(value, __u32);
 } pool_ips SEC(".maps");
+
+/*
+ * Local IPv6 Address Map: 存储本机 IPv6 地址 (用于 NDP 代理应答)
+ * Key = 0 (__u32)
+ * Value = __u32[4] (16 bytes, 与 s6_addr32 对齐)
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32[4]);
+} local_ip6 SEC(".maps");
 
 /* 统计计数器 Map (可选, 用于调试) */
 struct {
@@ -77,25 +101,119 @@ int xdp_nat64_func(struct xdp_md *ctx) {
 
 	__u16 h_proto = eth->h_proto;
 
-	/* 处理 IPv6 -> IPv4 (寻找 NAT64 前缀 64:ff9b::/96) */
+	/* 处理 IPv6 流量 */
 	if (h_proto == __constant_htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6 = (data + sizeof(struct ethhdr));
 		if ((void *)(ip6 + 1) > data_end)
 			return XDP_PASS;
 
 		/*
-		 * 检查目的地址前缀: 64:ff9b::/96
-		 * IPv6 地址前 12 字节 (96 bits):
-		 *   s6_addr32[0] = 0x0064ff9b (网络字节序: 0x9bff6400)
-		 *   s6_addr32[1] = 0x00000000
-		 *   s6_addr32[2] = 0x00000000
-		 * 最后 4 字节 (s6_addr32[3]) = 嵌入的 IPv4 地址
+		 * NDP 代理: 对本机 IPv6 地址的 Neighbor Solicitation 就地回复 NA
+		 *
+		 * 当 XDP Generic + AF_XDP 附着时, 内核的 NDP 响应可能被干扰,
+		 * 导致路由器无法解析本机 MAC → 所有入站流量中断。
+		 * 在 XDP 层直接回复 NA 彻底避免此问题。
 		 */
-		if (ip6->daddr.s6_addr32[0] == __constant_htonl(0x0064ff9b) &&
-		    ip6->daddr.s6_addr32[1] == 0 &&
-		    ip6->daddr.s6_addr32[2] == 0) {
-			inc_stat(STAT_IPV6_REDIRECTED);
-			return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, 0);
+		if (ip6->nexthdr == 58) { /* ICMPv6 */
+			__u8 *icmp6 = (__u8 *)(ip6 + 1);
+			/* NA 需要写 32 字节 ICMPv6, 确保空间足够 */
+			if ((void *)(icmp6 + 32) > data_end)
+				goto nat64_check;
+
+			if (icmp6[0] == 135 && icmp6[1] == 0) { /* NS type=135 code=0 */
+				/* NS target address 在 ICMPv6 偏移 8 处 */
+				__u32 *ns_target = (__u32 *)(icmp6 + 8);
+
+				__u32 lk = 0;
+				__u32 *local = bpf_map_lookup_elem(&local_ip6, &lk);
+				if (!local)
+					goto nat64_check;
+
+				if (ns_target[0] != local[0] || ns_target[1] != local[1] ||
+				    ns_target[2] != local[2] || ns_target[3] != local[3])
+					goto nat64_check; /* 不是请求我们的地址 */
+
+				/* === 构造 Neighbor Advertisement === */
+				__u8 our_mac[6];
+				__builtin_memcpy(our_mac, eth->h_dest, 6);
+
+				/* 以太网: 交换 src/dst MAC */
+				__builtin_memcpy(eth->h_dest, eth->h_source, 6);
+				__builtin_memcpy(eth->h_source, our_mac, 6);
+
+				/* IPv6: src=我们的IP, dst=请求者的IP */
+				struct in6_addr req_ip;
+				__builtin_memcpy(&req_ip, &ip6->saddr, 16);
+				__builtin_memcpy(&ip6->saddr, ns_target, 16);
+				__builtin_memcpy(&ip6->daddr, &req_ip, 16);
+				ip6->hop_limit = 255;
+				ip6->payload_len = __constant_htons(32);
+
+				/* ICMPv6 NA header */
+				icmp6[0] = 136;  /* Type: NA */
+				icmp6[1] = 0;
+				icmp6[2] = 0; icmp6[3] = 0; /* checksum 清零 */
+				icmp6[4] = 0x60; /* Flags: S=1, O=1 */
+				icmp6[5] = 0; icmp6[6] = 0; icmp6[7] = 0;
+				/* target addr 在 [8..23] 已经是正确的 (来自 NS) */
+
+				/* Option: Target Link-Layer Address */
+				icmp6[24] = 2;   /* type=2 */
+				icmp6[25] = 1;   /* length=1 (8字节) */
+				__builtin_memcpy(icmp6 + 26, our_mac, 6);
+
+				/* 计算 ICMPv6 校验和 (伪首部 + 报文) */
+				__u32 csum = 0;
+				__u16 *p;
+				/* 伪首部: src addr */
+				p = (__u16 *)&ip6->saddr;
+				csum += p[0]; csum += p[1]; csum += p[2]; csum += p[3];
+				csum += p[4]; csum += p[5]; csum += p[6]; csum += p[7];
+				/* 伪首部: dst addr */
+				p = (__u16 *)&ip6->daddr;
+				csum += p[0]; csum += p[1]; csum += p[2]; csum += p[3];
+				csum += p[4]; csum += p[5]; csum += p[6]; csum += p[7];
+				/* 伪首部: length + next header */
+				csum += __constant_htons(32);
+				csum += __constant_htons(58);
+				/* ICMPv6 报文 (32字节 = 16个16位字) */
+				p = (__u16 *)icmp6;
+				csum += p[0]; csum += p[1]; csum += p[2]; csum += p[3];
+				csum += p[4]; csum += p[5]; csum += p[6]; csum += p[7];
+				csum += p[8]; csum += p[9]; csum += p[10]; csum += p[11];
+				csum += p[12]; csum += p[13]; csum += p[14]; csum += p[15];
+				/* 折叠进位 */
+				csum = (csum & 0xFFFF) + (csum >> 16);
+				csum = (csum & 0xFFFF) + (csum >> 16);
+				icmp6[2] = (~csum) & 0xFF;
+				icmp6[3] = (~csum >> 8) & 0xFF;
+
+				return XDP_TX;
+			}
+		}
+
+nat64_check:
+		;
+		/*
+		 * NAT64 前缀匹配: 优先使用 dynamic prefix_map 中由用户态设置的自定义前缀
+		 */
+		__u32 map_key = 0;
+		__u32 *prefix = bpf_map_lookup_elem(&prefix_map, &map_key);
+		
+		if (prefix && (prefix[0] != 0 || prefix[1] != 0)) {
+			if (ip6->daddr.s6_addr32[0] == prefix[0] &&
+			    ip6->daddr.s6_addr32[1] == prefix[1] &&
+			    ip6->daddr.s6_addr32[2] == prefix[2]) {
+				inc_stat(STAT_IPV6_REDIRECTED);
+				return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, 0);
+			}
+		} else {
+			if (ip6->daddr.s6_addr32[0] == __constant_htonl(0x0064ff9b) &&
+			    ip6->daddr.s6_addr32[1] == 0 &&
+			    ip6->daddr.s6_addr32[2] == 0) {
+				inc_stat(STAT_IPV6_REDIRECTED);
+				return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, 0);
+			}
 		}
 	}
 

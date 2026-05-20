@@ -1,6 +1,7 @@
 package nat64
 
 import (
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -14,7 +15,7 @@ import (
 //   - 动态学习: 从入站帧的 srcMAC 学习 IP→MAC 映射
 //
 // 在 AF_XDP 模式下, 内核协议栈不参与包处理, 因此我们必须自己管理
-// 邻居关系 (相当于用户态的 ARP/NDP 缓存表)。
+// 邻居关系 (相当于用户态 of ARP/NDP 缓存表)。
 // ============================================================================
 
 // NeighborEntry 邻居表条目
@@ -58,6 +59,14 @@ func (nt *NeighborTable) Learn(ip net.IP, mac net.HardwareAddr) {
 		return // 不覆盖静态条目
 	}
 
+	// 仅当 IP 映射不存在，或者 MAC 地址发生实际变更时才更新并打印日志，避免重复包高频刷屏
+	if exists && existing.MAC.String() == mac.String() {
+		nt.mu.Lock()
+		existing.LastSeen = time.Now()
+		nt.mu.Unlock()
+		return
+	}
+
 	macCopy := make(net.HardwareAddr, len(mac))
 	copy(macCopy, mac)
 
@@ -67,6 +76,8 @@ func (nt *NeighborTable) Learn(ip net.IP, mac net.HardwareAddr) {
 		LastSeen: time.Now(),
 	}
 	nt.mu.Unlock()
+
+	log.Printf("[NeighborTable] 💡 动态学到新邻居 MAC 映射: IP %s -> MAC %s (首次学到: %v)", key, mac.String(), !exists)
 }
 
 // Lookup 查找 IP 对应的 MAC 地址

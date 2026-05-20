@@ -153,11 +153,16 @@ func (st *SessionTable) Lookup6to4(key6 SessionKey6) (*Session, error) {
 	}
 
 	if !isStatic {
-		// 分配 IPv4 出口动态端口 (N:1 PAT)
-		var err error
-		mappedPort, err = st.allocatePort()
-		if err != nil {
-			return nil, err
+		if key6.Proto == ProtoICMP {
+			// ICMP: 保留原始 Identifier 作为 mapped port (不需要动态分配)
+			mappedPort = key6.SrcPort
+		} else {
+			// TCP/UDP: 分配 IPv4 出口动态端口 (N:1 PAT)
+			var err error
+			mappedPort, err = st.allocatePort()
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 

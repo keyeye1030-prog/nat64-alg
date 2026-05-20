@@ -223,7 +223,14 @@ func (t *Translator) process4to6(dstMAC, srcMAC, ipv4Raw []byte) *ProcessResult 
 	}
 
 	// 查找反向会话
-	sess, ok := t.SessionTable.LookupByMappedPort(dstIPv4, srcIPv4, srcPort, dstPort, proto)
+	var sess *Session
+	var ok bool
+	if proto == ProtoICMP {
+		// ICMP: ID 在 srcPort 中, 对应会话的 SrcPort (mappedPort=srcPort, remotePort=0)
+		sess, ok = t.SessionTable.LookupByMappedPort(dstIPv4, srcIPv4, dstPort, srcPort, proto)
+	} else {
+		sess, ok = t.SessionTable.LookupByMappedPort(dstIPv4, srcIPv4, srcPort, dstPort, proto)
+	}
 	if !ok {
 		atomic.AddUint64(&t.PktsDropped, 1)
 		return &ProcessResult{Error: fmt.Errorf("找不到反向会话: %s:%d -> %s:%d",

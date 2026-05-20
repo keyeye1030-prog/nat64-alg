@@ -8,14 +8,27 @@ import "net"
 // ============================================================================
 
 var (
-	// WellKnownPrefix 是 NAT64 标准前缀 64:ff9b::/96
-	// IPv4 地址嵌入在最后 32 bit: 64:ff9b::C0A8:0101 == 192.168.1.1
-	WellKnownPrefix = net.IP{0x00, 0x64, 0xff, 0x9b,
+	// WellKnownPrefix 是 NAT64 前缀
+	// 默认值是标准 Well-Known Prefix: 64:ff9b::/96 (RFC 6052)
+	WellKnownPrefix = net.IP{
+		0x00, 0x64, 0xff, 0x9b,
 		0x00, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00}
+		0x00, 0x00, 0x00, 0x00,
+	}
 	WellKnownPrefixLen = 96
 )
+
+// SetNAT64Prefix 动态设置自定义的 NAT64 前缀 (第一段 96 bits / 12 字节)
+func SetNAT64Prefix(prefix net.IP) {
+	v6 := prefix.To16()
+	if v6 == nil {
+		return
+	}
+	for i := 0; i < 12; i++ {
+		WellKnownPrefix[i] = v6[i]
+	}
+}
 
 // IPv4ToIPv6 将 IPv4 地址用 NAT64 well-known prefix 嵌入为合成的 IPv6 地址
 // 例如: 192.168.1.1 -> 64:ff9b::c0a8:0101
