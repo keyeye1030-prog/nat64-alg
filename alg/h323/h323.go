@@ -84,9 +84,9 @@ const (
 
 // TPKTFrame 表示一个 TPKT 帧
 type TPKTFrame struct {
-	Version  uint8
-	Length   uint16
-	Payload  []byte // Q.931 content
+	Version uint8
+	Length  uint16
+	Payload []byte // Q.931 content
 }
 
 // ParseTPKT 解析 TPKT 帧
@@ -139,17 +139,21 @@ func SerializeTPKT(payload []byte) []byte {
 
 // TransportAddress 表示 H.323 中的传输地址
 type TransportAddress struct {
-	IsIPv6  bool
-	IP      net.IP
-	Port    uint16
-	Offset  int // 在原始数据中的字节偏移
-	Length  int // 该字段在原始数据中的总长度
+	IsIPv6 bool
+	IP     net.IP
+	Port   uint16
+	Offset int // 在原始数据中的字节偏移
+	Length int // 该字段在原始数据中的总长度
 }
 
 // ScanTransportAddresses 在二进制载荷中搜索所有可能的 TransportAddress
 // 使用启发式模式匹配: 搜索连续的 4 或 16 字节 IP + 2 字节合法端口
-func ScanTransportAddresses(data []byte, prefix net.IP) []TransportAddress {
+func ScanTransportAddresses(data []byte, prefixes ...net.IP) []TransportAddress {
 	var results []TransportAddress
+	var prefix net.IP
+	if len(prefixes) > 0 {
+		prefix = prefixes[0]
+	}
 
 	// 搜索 IPv6 TransportAddress 模式 (18 bytes: 16 IP + 2 Port)
 	for i := 0; i <= len(data)-18; i++ {
@@ -221,9 +225,10 @@ func ScanTransportAddresses(data []byte, prefix net.IP) []TransportAddress {
 // 注意: 由于 IPv6(18B) 和 IPv4(6B) 的 TransportAddress 长度不同,
 // 如果是严格 PER 编码, 简单就地替换会破坏后续解析。
 // 因此本实现采用"就地覆写 + 保持原长"策略:
-//   将 16 字节 IPv6 地址区域的前 4 字节写入 IPv4 地址,
-//   后 12 字节清零 (作为 padding)。
-//   这在实际 H.323 协议栈实现中是一种工程折衷, 适用于大多数终端设备。
+//
+//	将 16 字节 IPv6 地址区域的前 4 字节写入 IPv4 地址,
+//	后 12 字节清零 (作为 padding)。
+//	这在实际 H.323 协议栈实现中是一种工程折衷, 适用于大多数终端设备。
 //
 // 对于更严格的场景, 需要完整的 ASN.1 PER 编解码器来做结构级重建。
 func (t *Translator) TranslateIPv6ToIPv4(payload []byte, clientIPv6, mappedIPv4 net.IP) (*ALGResult, error) {
@@ -359,7 +364,7 @@ func ParseQ931(data []byte) (msgType Q931MessageType, h225Payload []byte, err er
 				if ieLen > 1 && data[ieDataStart] == 0x05 {
 					return msgType, data[ieDataStart+1 : ieDataStart+ieLen], nil
 				}
-				return msgType, data[ieDataStart:ieDataStart+ieLen], nil
+				return msgType, data[ieDataStart : ieDataStart+ieLen], nil
 			}
 		}
 

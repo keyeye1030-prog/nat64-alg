@@ -187,9 +187,10 @@ func TranslateIPv4ToIPv6WithFragments(rawIPv4 []byte, srcIPv6, dstIPv6 net.IP) (
 		return nil, err
 	}
 
-	// 非分片包: 标准翻译 (无需 Fragment Header)
-	// 注: RFC 8021 已废弃 "atomic fragments", DF=0 的非分片包也不添加 Fragment Header
 	if !fragInfo.IsFragment {
+		if !fragInfo.DontFragment {
+			return translateIPv4ToIPv6WithFragHdr(rawIPv4, fragInfo, srcIPv6, dstIPv6)
+		}
 		return TranslateIPv4ToIPv6(rawIPv4, srcIPv6, dstIPv6)
 	}
 

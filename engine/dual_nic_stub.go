@@ -1,3 +1,4 @@
+//go:build !linux
 // +build !linux
 
 package engine
@@ -24,6 +25,7 @@ type DualNICConfig struct {
 	IPv4Interface  string
 	PoolIPv4s      []net.IP
 	GatewayIPv6    net.IP
+	IPv6Gateway    net.IP
 	IPv4GatewayMAC net.HardwareAddr
 	IPv6GatewayMAC net.HardwareAddr
 	EnableARPProxy bool

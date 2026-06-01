@@ -23,10 +23,10 @@ const (
 // Translator 是 NAT64 翻译器的主入口
 type Translator struct {
 	SessionTable *SessionTable
-	PoolIPv4     net.IP // NAT64 网关的 IPv4 出口地址
+	PoolIPv4     net.IP      // NAT64 网关的 IPv4 出口地址
 	ALG          *ALGHandler // SIP/H.323 应用层网关
 	MAC          *MACConfig  // 二层 MAC 地址配置
-	DebugLog     bool   // 是否输出每包调试日志
+	DebugLog     bool        // 是否输出每包调试日志
 
 	// 统计计数器 (原子操作)
 	Pkts6to4     uint64
@@ -56,7 +56,7 @@ const (
 
 // ProcessResult 是管道对输入帧处理后的输出
 type ProcessResult struct {
-	OutputFrame []byte    // 转换后的完整以太帧 (或 nil 表示丢弃)
+	OutputFrame []byte // 转换后的完整以太帧 (或 nil 表示丢弃)
 	Direction   Direction
 	Error       error
 }
@@ -251,7 +251,7 @@ func (t *Translator) process4to6(dstMAC, srcMAC, ipv4Raw []byte) *ProcessResult 
 		if err == nil {
 			// 恢复原始目的端口 (需要找到传输层头的正确偏移)
 			transportOff := IPv6HeaderLen
-			if fragInfo != nil && fragInfo.IsFragment {
+			if resultPayload[6] == ExtHdrFragment {
 				transportOff += FragmentHdrLen // 跳过 Fragment Header
 			}
 			patchDstPort(resultPayload[transportOff:], sess.Key6.SrcPort)

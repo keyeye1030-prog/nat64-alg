@@ -82,7 +82,7 @@ func (a *ALGHandler) ProcessALG6to4(ipv4Pkt []byte, sess *Session) ([]byte, int)
 		// 执行 Seq/Ack 修正
 		oldSeq := binary.BigEndian.Uint32(transportHdr[4:8])
 		oldAck := binary.BigEndian.Uint32(transportHdr[8:12])
-		
+
 		newSeq := sess.TCPTracker.Dir6to4.AdjustSeq(oldSeq)
 		newAck := sess.TCPTracker.Dir4to6.AdjustAck(oldAck)
 
@@ -109,12 +109,14 @@ func (a *ALGHandler) ProcessALG6to4(ipv4Pkt []byte, sess *Session) ([]byte, int)
 
 	if payloadOffset >= len(ipv4Pkt) {
 		// 无载荷包 (如纯 ACK), 也要返回修改后的 Seq/Ack
-		return ipv4Pkt, 0 
+		return ipv4Pkt, 0
 	}
 	appPayload := ipv4Pkt[payloadOffset:]
 
 	clientIPv6 := net.IP(sess.Key6.SrcIP[:]).To16()
-	mappedIPv4 := net.IP(sess.Key4.SrcIP[:]).To4()
+	synthServerIPv6 := net.IP(sess.Key6.DstIP[:]).To16()
+	mappedClientIPv4 := net.IP(sess.Key4.SrcIP[:]).To4()
+	serverIPv4 := net.IP(sess.Key4.DstIP[:]).To4()
 
 	var modifiedPayload []byte
 	var lengthDelta int
@@ -133,7 +135,7 @@ func (a *ALGHandler) ProcessALG6to4(ipv4Pkt []byte, sess *Session) ([]byte, int)
 		}
 
 		// SIP ALG 地址翻译
-		result, err := a.sipTranslator.TranslateIPv6ToIPv4(appPayload, clientIPv6, mappedIPv4)
+		result, err := a.sipTranslator.TranslateIPv6ToIPv4(appPayload, mappedClientIPv4, clientIPv6, serverIPv4, synthServerIPv6)
 		if err != nil {
 			log.Printf("[ALG-SIP] 6→4 处理失败: %v", err)
 			return ipv4Pkt, 0
@@ -146,7 +148,7 @@ func (a *ALGHandler) ProcessALG6to4(ipv4Pkt []byte, sess *Session) ([]byte, int)
 				callID = fmt.Sprintf("sess-%d-%d", sess.Key6.SrcPort, sess.Key6.DstPort)
 			}
 			modifiedPayload, lengthDelta = a.allocateRelaysAndRewriteSDP(
-				result, sess, clientIPv6, mappedIPv4, callID)
+				result, sess, clientIPv6, mappedClientIPv4, callID)
 		} else {
 			modifiedPayload = result.ModifiedPayload
 			lengthDelta = result.LengthDelta
@@ -154,7 +156,7 @@ func (a *ALGHandler) ProcessALG6to4(ipv4Pkt []byte, sess *Session) ([]byte, int)
 
 	} else if isH323Port(srcPort, dstPort) {
 		// H.323 ALG
-		result, err := a.h323Translator.ProcessH225Message(appPayload, clientIPv6, mappedIPv4, "6to4")
+		result, err := a.h323Translator.ProcessH225Message(appPayload, clientIPv6, mappedClientIPv4, "6to4")
 		if err != nil {
 			log.Printf("[ALG-H323] 6→4 处理失败: %v", err)
 			return ipv4Pkt, 0
@@ -162,7 +164,7 @@ func (a *ALGHandler) ProcessALG6to4(ipv4Pkt []byte, sess *Session) ([]byte, int)
 
 		// 如果有 RTP 中继管理器, 为 H.323 发现的端口分配中继
 		if a.relayManager != nil && len(result.MediaPorts) > 0 {
-			modifiedPayload, lengthDelta = a.allocateH323Relays(result, sess, clientIPv6, mappedIPv4)
+			modifiedPayload, lengthDelta = a.allocateH323Relays(result, sess, clientIPv6, mappedClientIPv4)
 		} else {
 			modifiedPayload = result.ModifiedPayload
 			lengthDelta = result.LengthDelta
@@ -260,8 +262,10 @@ func (a *ALGHandler) ProcessALG4to6(ipv6Pkt []byte, sess *Session) ([]byte, int)
 	}
 	appPayload := ipv6Pkt[payloadOffset:]
 
+	mappedClientIPv4 := net.IP(sess.Key4.SrcIP[:]).To4()
 	serverIPv4 := net.IP(sess.Key4.DstIP[:]).To4()
 	clientIPv6 := net.IP(sess.Key6.SrcIP[:]).To16()
+	synthServerIPv6 := net.IP(sess.Key6.DstIP[:]).To16()
 
 	var modifiedPayload []byte
 	var lengthDelta int
@@ -277,7 +281,7 @@ func (a *ALGHandler) ProcessALG4to6(ipv6Pkt []byte, sess *Session) ([]byte, int)
 			}
 		}
 
-		result, err := a.sipTranslator.TranslateIPv4ToIPv6(appPayload, serverIPv4, clientIPv6)
+		result, err := a.sipTranslator.TranslateIPv4ToIPv6(appPayload, mappedClientIPv4, clientIPv6, serverIPv4, synthServerIPv6)
 		if err != nil {
 			log.Printf("[ALG-SIP] 4→6 处理失败: %v", err)
 			return ipv6Pkt, 0
@@ -285,7 +289,7 @@ func (a *ALGHandler) ProcessALG4to6(ipv6Pkt []byte, sess *Session) ([]byte, int)
 		modifiedPayload = result.ModifiedPayload
 		lengthDelta = result.LengthDelta
 	} else if isH323Port(srcPort, dstPort) {
-		result, err := a.h323Translator.ProcessH225Message(appPayload, clientIPv6, serverIPv4, "4to6")
+		result, err := a.h323Translator.ProcessH225Message(appPayload, clientIPv6, mappedClientIPv4, "4to6")
 		if err != nil {
 			log.Printf("[ALG-H323] 4→6 处理失败: %v", err)
 			return ipv6Pkt, 0
@@ -353,9 +357,9 @@ func (a *ALGHandler) allocateRelaysAndRewriteSDP(
 		// 分配中继端口对 (RTP + RTCP)
 		pair, err := a.relayManager.AllocateRelayPair(
 			callID,
-			"audio",                           // 媒体类型
-			clientIPv6, mp.OriginalPort,       // IPv6 终端
-			remoteIPv4, mp.OriginalPort,       // IPv4 终端 (首包学习更新)
+			"audio",                     // 媒体类型
+			clientIPv6, mp.OriginalPort, // IPv6 终端
+			remoteIPv4, mp.OriginalPort, // IPv4 终端 (首包学习更新)
 		)
 		if err != nil {
 			log.Printf("[ALG-RTP] 分配中继失败: %v", err)
@@ -430,7 +434,7 @@ func (a *ALGHandler) allocateH323Relays(
 			continue
 		}
 
-		// TODO: H.323 的二进制重写比较复杂。目前的实现中, 
+		// TODO: H.323 的二进制重写比较复杂。目前的实现中,
 		// h323Result.ModifiedPayload 已经将 IPv6 改成了 IPv4 并填充了 0。
 		// 在生产环境中, 我们需要再次扫描二进制载荷并修正刚刚填入的 4字节 IPv4 中的端口信息(如果发生了变化)。
 		// 这里暂且认为中继端口和原始端口一致, 因为我们的中继管理器会尽量尝试分配相同端口。

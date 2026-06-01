@@ -13,6 +13,14 @@
 
 # Go workspace
 go.work
+.gocache/
+.gomodcache/
+
+# Local configuration and secrets
+config.json
+
+# Node dependencies
+node_modules/
 
 # IDE
 .vscode/

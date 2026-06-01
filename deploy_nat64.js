@@ -1,6 +1,18 @@
 const { Client } = require('ssh2');
 const fs = require('fs');
 
+const host = process.env.NAT64_SSH_HOST;
+const port = Number(process.env.NAT64_SSH_PORT || 22);
+const username = process.env.NAT64_SSH_USER;
+const password = process.env.NAT64_SSH_PASSWORD;
+const sudoPassword = process.env.NAT64_SUDO_PASSWORD || password;
+
+if (!host || !username || !password || !sudoPassword) {
+  throw new Error('Set NAT64_SSH_HOST, NAT64_SSH_USER, NAT64_SSH_PASSWORD, and optionally NAT64_SUDO_PASSWORD before running this script.');
+}
+
+const sudo = (cmd) => ({ command: `sudo -S ${cmd}`, sudo: true });
+
 const conn = new Client();
 conn.on('ready', () => {
   console.log('Client :: ready');
@@ -19,8 +31,8 @@ conn.on('ready', () => {
       
       const commands = [
         // 1. Set IPv6 address on enp2s0f0
-        'echo "cernet@226!" | sudo -S ip addr add 1111::2/126 dev enp2s0f0 2>/dev/null || true',
-        'echo "cernet@226!" | sudo -S ip link set dev enp2s0f0 up',
+        sudo('ip addr add 1111::2/126 dev enp2s0f0 2>/dev/null || true'),
+        sudo('ip link set dev enp2s0f0 up'),
         
         // 2. Clear old directories and create new workspace
         'rm -rf /home/cernet/nat64-alg',
@@ -53,7 +65,10 @@ conn.on('ready', () => {
   "ipv6_gateway": "1111::1",
   "ipv4_gateway_mac": "48:8e:ef:9f:26:3d",
   "rtp_port_start": 20000,
-  "rtp_port_end": 30000
+  "rtp_port_end": 30000,
+  "static_mappings": {
+    "2001:da8:20d:7000:598a:b9cd:664a:429b": "121.194.15.71"
+  }
 }
 EOF`,
 
@@ -83,17 +98,17 @@ WantedBy=multi-user.target
 EOF`,
 
         // 10. Move service file using sudo (without here-doc, safe from stdin conflict)
-        'echo "cernet@226!" | sudo -S mv /home/cernet/nat64-alg.service /etc/systemd/system/nat64-alg.service',
+        sudo('mv /home/cernet/nat64-alg.service /etc/systemd/system/nat64-alg.service'),
 
         // 11. Reload systemd daemon and restart the service
-        'echo "cernet@226!" | sudo -S systemctl daemon-reload',
-        'echo "cernet@226!" | sudo -S systemctl enable nat64-alg',
-        'echo "cernet@226!" | sudo -S systemctl restart nat64-alg',
+        sudo('systemctl daemon-reload'),
+        sudo('systemctl enable nat64-alg'),
+        sudo('systemctl restart nat64-alg'),
         
         // 12. Wait a little and show status & logs
         'sleep 3',
-        'echo "cernet@226!" | sudo -S systemctl status nat64-alg || true',
-        'echo "cernet@226!" | sudo -S journalctl -u nat64-alg -n 30 || true'
+        sudo('systemctl status nat64-alg || true'),
+        sudo('journalctl -u nat64-alg -n 30 || true')
       ];
       
       function runNext(index) {
@@ -102,12 +117,16 @@ EOF`,
           conn.end();
           return;
         }
-        console.log(`\n--- Running [${index}]: ${commands[index].substring(0, 100)}... ---`);
-        conn.exec(commands[index], (err, stream) => {
+        const step = typeof commands[index] === 'string' ? { command: commands[index] } : commands[index];
+        console.log(`\n--- Running [${index}]: ${step.command.substring(0, 100)}... ---`);
+        conn.exec(step.command, (err, stream) => {
           if (err) {
             console.error(`Exec error: ${err}`);
             conn.end();
             return;
+          }
+          if (step.sudo) {
+            stream.write(`${sudoPassword}\n`);
           }
           stream.on('close', (code) => {
             console.log(`Command [${index}] finished with code ${code}`);
@@ -133,10 +152,10 @@ EOF`,
 }).on('error', (err) => {
   console.log('ERROR: ' + err);
 }).connect({
-  host: '121.194.10.55',
-  port: 7122,
-  username: 'cernet',
-  password: 'cernet@226!',
+  host,
+  port,
+  username,
+  password,
   algorithms: {
     kex: [
       'curve25519-sha256',

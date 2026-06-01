@@ -6,7 +6,6 @@ import (
 	"net"
 	"regexp"
 	"strconv"
-	"strings"
 )
 
 // ============================================================================
@@ -30,8 +29,8 @@ import (
 
 // ALGResult 是 SIP ALG 处理结果
 type ALGResult struct {
-	ModifiedPayload []byte // 修改后的 SIP 信令
-	LengthDelta     int    // 载荷长度变化量 (用于 TCP 序列号偏移追踪)
+	ModifiedPayload []byte      // 修改后的 SIP 信令
+	LengthDelta     int         // 载荷长度变化量 (用于 TCP 序列号偏移追踪)
 	MediaPorts      []MediaPort // 需要开放的 RTP/RTCP 端口映射
 }
 
@@ -71,6 +70,10 @@ var (
 	// 匹配 Record-Route / Route 头
 	reRouteIPv6 = regexp.MustCompile(`(?i)((?:Record-)?Route:\s*<sip:[^@]*@)\[([0-9a-fA-F:]+)\](?::(\d+))?(>?)`)
 
+	reViaIPv4     = regexp.MustCompile(`(?i)(Via:\s*SIP/2\.0/(?:UDP|TCP|TLS)\s+)(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?`)
+	reContactIPv4 = regexp.MustCompile(`(?i)(Contact:\s*<?sip:[^@]*@)(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?(>?)`)
+	reRouteIPv4   = regexp.MustCompile(`(?i)((?:Record-)?Route:\s*<sip:[^@]*@)(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?(>?)`)
+
 	// SDP: c= 行 (Connection Data)
 	// c=IN IP6 2001:db8::1
 	reSDPConnection = regexp.MustCompile(`(?m)^(c=IN\s+)IP6\s+([0-9a-fA-F:]+)\s*$`)
@@ -95,11 +98,12 @@ var (
 )
 
 // TranslateIPv6ToIPv4 将 SIP 信令中的 IPv6 地址重写为 IPv4 地址
-// 用于 6→4 方向: IPv6 客户端发出的 SIP 请求/响应
-func (t *Translator) TranslateIPv6ToIPv4(sipPayload []byte, clientIPv6, mappedIPv4 net.IP) (*ALGResult, error) {
+// 用于 6→4 方向: IPv6 服务器的回包或请求
+func (t *Translator) TranslateIPv6ToIPv4(sipPayload []byte, ips ...net.IP) (*ALGResult, error) {
 	if len(sipPayload) == 0 {
 		return nil, fmt.Errorf("空的 SIP 负载")
 	}
+	clientIPv4, clientIPv6, serverIPv4, serverIPv6 := t.normalizeIPv6ToIPv4Args(ips)
 
 	originalLen := len(sipPayload)
 	result := &ALGResult{}
@@ -117,12 +121,12 @@ func (t *Translator) TranslateIPv6ToIPv4(sipPayload []byte, clientIPv6, mappedIP
 	}
 
 	// ---- 重写 SIP Header ----
-	modifiedHeader := t.rewriteSIPHeaders(headerPart, clientIPv6, mappedIPv4)
+	modifiedHeader := t.rewriteSIPHeaders(headerPart, clientIPv4, clientIPv6, serverIPv4, serverIPv6)
 
 	// ---- 重写 SDP Body ----
 	var modifiedBody []byte
 	if len(bodyPart) > 0 {
-		modifiedBody, result.MediaPorts = t.rewriteSDP(bodyPart, clientIPv6, mappedIPv4)
+		modifiedBody, result.MediaPorts = t.rewriteSDP(bodyPart, clientIPv4, clientIPv6, serverIPv4, serverIPv6)
 	}
 
 	// ---- 重组完整 SIP 消息 ----
@@ -139,11 +143,12 @@ func (t *Translator) TranslateIPv6ToIPv4(sipPayload []byte, clientIPv6, mappedIP
 }
 
 // TranslateIPv4ToIPv6 将 SIP 信令中的 IPv4 地址重写为 IPv6 地址
-// 用于 4→6 方向: IPv4 服务器的回包
-func (t *Translator) TranslateIPv4ToIPv6(sipPayload []byte, serverIPv4, clientIPv6 net.IP) (*ALGResult, error) {
+// 用于 4→6 方向: IPv4 客户端发出的 SIP 请求
+func (t *Translator) TranslateIPv4ToIPv6(sipPayload []byte, ips ...net.IP) (*ALGResult, error) {
 	if len(sipPayload) == 0 {
 		return nil, fmt.Errorf("空的 SIP 负载")
 	}
+	clientIPv4, clientIPv6, serverIPv4, serverIPv6 := t.normalizeIPv4ToIPv6Args(ips)
 
 	originalLen := len(sipPayload)
 	result := &ALGResult{}
@@ -160,12 +165,12 @@ func (t *Translator) TranslateIPv4ToIPv6(sipPayload []byte, serverIPv4, clientIP
 	}
 
 	// ---- SIP Header: IPv4 -> IPv6 ----
-	modifiedHeader := t.rewriteSIPHeaders4to6(headerPart, serverIPv4, clientIPv6)
+	modifiedHeader := t.rewriteSIPHeaders4to6(headerPart, clientIPv4, clientIPv6, serverIPv4, serverIPv6)
 
 	// ---- SDP Body: IPv4 -> IPv6 ----
 	var modifiedBody []byte
 	if len(bodyPart) > 0 {
-		modifiedBody = t.rewriteSDP4to6(bodyPart, serverIPv4, clientIPv6)
+		modifiedBody = t.rewriteSDP4to6(bodyPart, clientIPv4, clientIPv6, serverIPv4, serverIPv6)
 	}
 
 	if len(modifiedBody) > 0 {
@@ -183,63 +188,99 @@ func (t *Translator) TranslateIPv4ToIPv6(sipPayload []byte, serverIPv4, clientIP
 // SIP Header 重写 (IPv6 -> IPv4)
 // ============================================================================
 
-func (t *Translator) rewriteSIPHeaders(header []byte, clientIPv6, mappedIPv4 net.IP) []byte {
+// rewriteSIPHeaders (IPv6 -> IPv4)
+func (t *Translator) rewriteSIPHeaders(header []byte, clientIPv4, clientIPv6, serverIPv4, serverIPv6 net.IP) []byte {
 	s := string(header)
-	ipv6Str := clientIPv6.String()
-	ipv4Str := mappedIPv4.String()
+
+	replaceFunc := func(match string, sub []string) string {
+		ipStr := sub[2]
+		port := sub[3]
+		closing := ""
+		if len(sub) > 4 {
+			closing = sub[4]
+		}
+
+		// If it's the server IPv6 (e.g. 2001:...) -> serverIPv4 (121.194.15.71)
+		if ipStr == serverIPv6.String() {
+			if port == "" {
+				return sub[1] + serverIPv4.String() + closing
+			}
+			return sub[1] + serverIPv4.String() + ":" + port + closing
+		}
+
+		// If it's the client's synthesized IPv6 -> clientIPv4 (121.194.15.15)
+		if ipStr == clientIPv6.String() {
+			if port == "" {
+				return sub[1] + clientIPv4.String() + closing
+			}
+			return sub[1] + clientIPv4.String() + ":" + port + closing
+		}
+
+		// Fallback for any other IPv6
+		if isAnyIPv6(ipStr) {
+			if port == "" {
+				return sub[1] + serverIPv4.String() + closing
+			}
+			return sub[1] + serverIPv4.String() + ":" + port + closing
+		}
+		return match
+	}
 
 	// Via: SIP/2.0/UDP [ipv6]:port -> Via: SIP/2.0/UDP ipv4:port
 	s = reViaIPv6.ReplaceAllStringFunc(s, func(match string) string {
-		sub := reViaIPv6.FindStringSubmatch(match)
-		if sub[2] == ipv6Str || isAnyIPv6(sub[2]) {
-			port := sub[3]
-			if port == "" {
-				return sub[1] + ipv4Str
-			}
-			return sub[1] + ipv4Str + ":" + port
-		}
-		return match
+		return replaceFunc(match, reViaIPv6.FindStringSubmatch(match))
 	})
 
 	// Contact: <sip:user@[ipv6]:port> -> <sip:user@ipv4:port>
 	s = reContactIPv6.ReplaceAllStringFunc(s, func(match string) string {
-		sub := reContactIPv6.FindStringSubmatch(match)
-		if sub[2] == ipv6Str || isAnyIPv6(sub[2]) {
-			port := sub[3]
-			closing := sub[4]
-			if port == "" {
-				return sub[1] + ipv4Str + closing
-			}
-			return sub[1] + ipv4Str + ":" + port + closing
-		}
-		return match
+		return replaceFunc(match, reContactIPv6.FindStringSubmatch(match))
 	})
 
 	// Route / Record-Route
 	s = reRouteIPv6.ReplaceAllStringFunc(s, func(match string) string {
-		sub := reRouteIPv6.FindStringSubmatch(match)
-		if sub[2] == ipv6Str || isAnyIPv6(sub[2]) {
-			port := sub[3]
-			closing := sub[4]
-			if port == "" {
-				return sub[1] + ipv4Str + closing
-			}
-			return sub[1] + ipv4Str + ":" + port + closing
-		}
-		return match
+		return replaceFunc(match, reRouteIPv6.FindStringSubmatch(match))
 	})
 
 	return []byte(s)
 }
 
 // rewriteSIPHeaders4to6 将 SIP Header 中的 IPv4 地址重写为 IPv6
-func (t *Translator) rewriteSIPHeaders4to6(header []byte, serverIPv4, clientIPv6 net.IP) []byte {
+func (t *Translator) rewriteSIPHeaders4to6(header []byte, clientIPv4, clientIPv6, serverIPv4, serverIPv6 net.IP) []byte {
 	s := string(header)
 
-	// 对 IPv4 地址的简单全局替换 (仅限注册的池地址)
-	poolStr := t.PoolIPv4.String()
-	ipv6Str := "[" + clientIPv6.String() + "]"
-	s = strings.ReplaceAll(s, poolStr, ipv6Str)
+	replaceFunc := func(match string, sub []string) string {
+		ip4 := net.ParseIP(sub[2]).To4()
+		if ip4 == nil {
+			return match
+		}
+		port := sub[3]
+		closing := ""
+		if len(sub) > 4 {
+			closing = sub[4]
+		}
+
+		target := clientIPv6
+		if ip4.Equal(serverIPv4.To4()) || ip4.Equal(t.PoolIPv4.To4()) {
+			target = serverIPv6
+		} else if !ip4.Equal(clientIPv4.To4()) {
+			return match
+		}
+
+		if port == "" {
+			return sub[1] + "[" + target.String() + "]" + closing
+		}
+		return sub[1] + "[" + target.String() + "]:" + port + closing
+	}
+
+	s = reViaIPv4.ReplaceAllStringFunc(s, func(match string) string {
+		return replaceFunc(match, reViaIPv4.FindStringSubmatch(match))
+	})
+	s = reContactIPv4.ReplaceAllStringFunc(s, func(match string) string {
+		return replaceFunc(match, reContactIPv4.FindStringSubmatch(match))
+	})
+	s = reRouteIPv4.ReplaceAllStringFunc(s, func(match string) string {
+		return replaceFunc(match, reRouteIPv4.FindStringSubmatch(match))
+	})
 
 	return []byte(s)
 }
@@ -248,21 +289,29 @@ func (t *Translator) rewriteSIPHeaders4to6(header []byte, serverIPv4, clientIPv6
 // SDP Body 重写
 // ============================================================================
 
-func (t *Translator) rewriteSDP(sdpBody []byte, clientIPv6, mappedIPv4 net.IP) ([]byte, []MediaPort) {
+func (t *Translator) rewriteSDP(sdpBody []byte, clientIPv4, clientIPv6, serverIPv4, serverIPv6 net.IP) ([]byte, []MediaPort) {
 	s := string(sdpBody)
 	var mediaPorts []MediaPort
-	ipv4Str := mappedIPv4.String()
+
+	replaceFunc := func(match string, sub []string) string {
+		ipStr := sub[2]
+		if ipStr == serverIPv6.String() {
+			return sub[1] + "IP4 " + serverIPv4.String()
+		}
+		if ipStr == clientIPv6.String() || isAnyIPv6(ipStr) {
+			return sub[1] + "IP4 " + clientIPv4.String()
+		}
+		return match
+	}
 
 	// c=IN IP6 xxxx -> c=IN IP4 yyyy
 	s = reSDPConnection.ReplaceAllStringFunc(s, func(match string) string {
-		sub := reSDPConnection.FindStringSubmatch(match)
-		return sub[1] + "IP4 " + ipv4Str
+		return replaceFunc(match, reSDPConnection.FindStringSubmatch(match))
 	})
 
 	// o=... IN IP6 xxxx -> o=... IN IP4 yyyy
 	s = reSDPOrigin.ReplaceAllStringFunc(s, func(match string) string {
-		sub := reSDPOrigin.FindStringSubmatch(match)
-		return sub[1] + "IP4 " + ipv4Str
+		return replaceFunc(match, reSDPOrigin.FindStringSubmatch(match))
 	})
 
 	// m=audio PORT ... — 记录端口, 可选重映射
@@ -270,49 +319,51 @@ func (t *Translator) rewriteSDP(sdpBody []byte, clientIPv6, mappedIPv4 net.IP) (
 		sub := reSDPMedia.FindStringSubmatch(match)
 		port, _ := strconv.ParseUint(sub[2], 10, 16)
 		mediaPorts = append(mediaPorts, MediaPort{
-			OriginalIP:   clientIPv6,
+			OriginalIP:   clientIPv6, // For 6->4, media mapped for the client
 			OriginalPort: uint16(port),
-			MappedIP:     mappedIPv4,
-			MappedPort:   uint16(port), // 暂时保持原端口; 生产环境需分配
+			MappedIP:     clientIPv4,
+			MappedPort:   uint16(port),
 			Proto:        "RTP",
 		})
-		// RTCP 通常是 RTP 端口 + 1
 		mediaPorts = append(mediaPorts, MediaPort{
 			OriginalIP:   clientIPv6,
 			OriginalPort: uint16(port) + 1,
-			MappedIP:     mappedIPv4,
+			MappedIP:     clientIPv4,
 			MappedPort:   uint16(port) + 1,
 			Proto:        "RTCP",
 		})
-		return match // m= 行端口暂不改动
+		return match
 	})
 
 	return []byte(s), mediaPorts
 }
 
 // rewriteSDP4to6 将 SDP 中的 IPv4 重写为 IPv6
-func (t *Translator) rewriteSDP4to6(sdpBody []byte, serverIPv4, clientIPv6 net.IP) []byte {
+func (t *Translator) rewriteSDP4to6(sdpBody []byte, clientIPv4, clientIPv6, serverIPv4, serverIPv6 net.IP) []byte {
 	s := string(sdpBody)
-	ipv6Str := clientIPv6.String()
 
 	// IPv4 的 c= 和 o= 行匹配
 	reC4 := regexp.MustCompile(`(?m)^(c=IN\s+)IP4\s+([\d.]+)\s*$`)
 	reO4 := regexp.MustCompile(`(?m)^(o=[^\r\n]*IN\s+)IP4\s+([\d.]+)\s*$`)
+	reA4 := regexp.MustCompile(`(?m)^(a=rtcp:\d+\s+IN\s+)IP4\s+([\d.]+)\s*$`)
+
+	replaceFunc := func(match string, sub []string) string {
+		ipStr := sub[2]
+		if ipStr == serverIPv4.String() || ipStr == t.PoolIPv4.String() {
+			return sub[1] + "IP6 " + serverIPv6.String()
+		}
+		// Any other IPv4 (like the client's public or local IP) maps to client's synthesized IPv6
+		return sub[1] + "IP6 " + clientIPv6.String()
+	}
 
 	s = reC4.ReplaceAllStringFunc(s, func(match string) string {
-		sub := reC4.FindStringSubmatch(match)
-		if sub[2] == t.PoolIPv4.String() || sub[2] == serverIPv4.String() {
-			return sub[1] + "IP6 " + ipv6Str
-		}
-		return match
+		return replaceFunc(match, reC4.FindStringSubmatch(match))
 	})
-
 	s = reO4.ReplaceAllStringFunc(s, func(match string) string {
-		sub := reO4.FindStringSubmatch(match)
-		if sub[2] == t.PoolIPv4.String() || sub[2] == serverIPv4.String() {
-			return sub[1] + "IP6 " + ipv6Str
-		}
-		return match
+		return replaceFunc(match, reO4.FindStringSubmatch(match))
+	})
+	s = reA4.ReplaceAllStringFunc(s, func(match string) string {
+		return replaceFunc(match, reA4.FindStringSubmatch(match))
 	})
 
 	return []byte(s)
@@ -342,4 +393,24 @@ func assembleSIPMessage(header, body []byte) []byte {
 func isAnyIPv6(s string) bool {
 	ip := net.ParseIP(s)
 	return ip != nil && ip.To4() == nil
+}
+
+func (t *Translator) normalizeIPv6ToIPv4Args(ips []net.IP) (clientIPv4, clientIPv6, serverIPv4, serverIPv6 net.IP) {
+	if len(ips) >= 4 {
+		return ips[0].To4(), ips[1].To16(), ips[2].To4(), ips[3].To16()
+	}
+	if len(ips) >= 2 {
+		return ips[1].To4(), ips[0].To16(), ips[1].To4(), ips[0].To16()
+	}
+	return t.PoolIPv4.To4(), nil, t.PoolIPv4.To4(), nil
+}
+
+func (t *Translator) normalizeIPv4ToIPv6Args(ips []net.IP) (clientIPv4, clientIPv6, serverIPv4, serverIPv6 net.IP) {
+	if len(ips) >= 4 {
+		return ips[0].To4(), ips[1].To16(), ips[2].To4(), ips[3].To16()
+	}
+	if len(ips) >= 2 {
+		return t.PoolIPv4.To4(), ips[1].To16(), ips[0].To4(), ips[1].To16()
+	}
+	return t.PoolIPv4.To4(), nil, t.PoolIPv4.To4(), nil
 }

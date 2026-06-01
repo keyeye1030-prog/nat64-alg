@@ -1,3 +1,4 @@
+//go:build !linux
 // +build !linux
 
 package engine
@@ -10,15 +11,13 @@ import (
 	"nat64-alg/nat64"
 )
 
-// 非 Linux 的存根(Stub)实现, 方便在 Windows 下做业务逻辑开发和单元测试
-
 type XDPEngine struct {
 	ifaceName  string
 	translator *nat64.Translator
 }
 
 func NewXDPEngine(ifaceName string, poolIPv4 net.IP) (*XDPEngine, error) {
-	log.Println("[WARN] 目前运行于 非 Linux 环境，XDP 底层处于存根(Stub)旁路模式。")
+	log.Println("[XDPEngine-Stub] non-Linux environment; XDP data plane is disabled")
 
 	poolIPv4s := []net.IP{poolIPv4}
 	sessionTable := nat64.NewSessionTable(poolIPv4s, 10000, 60000, 5*time.Minute)
@@ -31,16 +30,14 @@ func NewXDPEngine(ifaceName string, poolIPv4 net.IP) (*XDPEngine, error) {
 }
 
 func (e *XDPEngine) Start() {
-	log.Println("[XDPEngine-Stub] 桩替服务运行中, 请使用 GOOS=linux 编译到 Linux 服务器执行。")
+	log.Println("[XDPEngine-Stub] service is running in stub mode")
 }
 
 func (e *XDPEngine) Close() {
-	log.Printf("[XDPEngine-Stub] 统计: 6→4=%d, 4→6=%d, 丢弃=%d",
+	log.Printf("[XDPEngine-Stub] stats: 6to4=%d, 4to6=%d, dropped=%d",
 		e.translator.Pkts6to4, e.translator.Pkts4to6, e.translator.PktsDropped)
-	log.Println("[XDPEngine-Stub] 桩替服务关闭。")
 }
 
-// GetTranslator 暴露翻译器, 方便单元测试
 func (e *XDPEngine) GetTranslator() *nat64.Translator {
 	return e.translator
 }

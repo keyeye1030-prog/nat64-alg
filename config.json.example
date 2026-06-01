@@ -1,10 +1,16 @@
 {
   "mode": "dual",
-  "pool_ipv4": "198.51.100.1",
+  "pool_ipv4s": ["198.51.100.1"],
   "interface": "eth0",
   "iface_ipv6": "eth0",
   "iface_ipv4": "eth1",
   "gw_ipv6": "2001:db8::1",
   "rtp_port_start": 20000,
-  "rtp_port_end": 30000
+  "rtp_port_end": 30000,
+  "preflight_enabled": true,
+  "preflight_min_speed_mbps": 1000,
+  "preflight_queues": 1,
+  "preflight_require_offloads_off": true,
+  "preflight_require_carrier": true,
+  "preflight_require_full_duplex": true
 }
