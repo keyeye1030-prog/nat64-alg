@@ -18,6 +18,13 @@ go.work
 
 # Local configuration and secrets
 config.json
+deploy_config.json
+capture_*.js
+check_*.js
+clear_*.js
+dump_*.js
+deploy_replace.js
+update_mapping.js
 
 # Node dependencies
 node_modules/

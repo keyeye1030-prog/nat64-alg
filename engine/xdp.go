@@ -123,13 +123,36 @@ func NewXDPEngine(ifaceName string, poolIPv4 net.IP) (*XDPEngine, error) {
 	sessionTable := nat64.NewSessionTable(poolIPv4s, 10000, 60000, 5*time.Minute)
 	translator := nat64.NewTranslator(poolIPv4s[0], sessionTable)
 
-	return &XDPEngine{
+	eng := &XDPEngine{
 		ifaceName:  ifaceName,
 		link:       l,
 		coll:       coll,
 		xsk:        xsk,
 		translator: translator,
-	}, nil
+	}
+
+	// 启动后台定期清理 (会话表 + 邻居表)
+	go eng.cleanerLoop(sessionTable)
+
+	return eng, nil
+}
+
+func (e *XDPEngine) cleanerLoop(table *nat64.SessionTable) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		cleaned := table.CleanExpired()
+		var cleanedNeighbors int
+		var remainingNeighbors int
+		if e.translator != nil && e.translator.MAC != nil && e.translator.MAC.Neighbors != nil {
+			cleanedNeighbors = e.translator.MAC.Neighbors.CleanExpired(5 * time.Minute)
+			remainingNeighbors = e.translator.MAC.Neighbors.Count()
+		}
+		if cleaned > 0 || cleanedNeighbors > 0 {
+			log.Printf("[XDPEngine] 清理 %d 条过期会话(剩余 %d), 清理 %d 条过期邻居(剩余 %d)",
+				cleaned, table.Stats(), cleanedNeighbors, remainingNeighbors)
+		}
+	}
 }
 
 // Start 开启数据帧处理

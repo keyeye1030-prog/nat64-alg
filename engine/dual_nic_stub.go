@@ -33,6 +33,7 @@ type DualNICConfig struct {
 	RTPPortEnd     uint16
 	SessionTTL     time.Duration
 	StaticMappings map[string]net.IP // 一对一静态映射 stub
+	DebugLog       bool
 }
 
 func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
@@ -53,6 +54,7 @@ func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
 		sessionTable.SetStaticMappings(config.StaticMappings)
 	}
 	translator := nat64.NewTranslator(config.PoolIPv4s[0], sessionTable)
+	translator.SetDebugLog(config.DebugLog)
 
 	gwIPv6 := config.GatewayIPv6
 	if gwIPv6 == nil {

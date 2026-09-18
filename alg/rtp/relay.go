@@ -255,11 +255,11 @@ func (rm *RelayManager) ReleaseRelay(localPort uint16) {
 	if ok {
 		relay.Stop()
 		atomic.AddInt64(&rm.activeCount, -1)
+		p64, b64, p46, b46 := relay.GetStats()
 		log.Printf("[RTPRelay] 释放: Call=%s, %s/%s, Port=%d, "+
 			"6→4: %d pkts/%d bytes, 4→6: %d pkts/%d bytes",
 			relay.CallID, relay.MediaType, relay.Proto, localPort,
-			relay.Packets6to4, relay.Bytes6to4,
-			relay.Packets4to6, relay.Bytes4to6)
+			p64, b64, p46, b46)
 	}
 }
 
@@ -282,15 +282,23 @@ func (rm *RelayManager) ReleaseByCallID(callID string) int {
 	for _, r := range relays {
 		r.Stop()
 		atomic.AddInt64(&rm.activeCount, -1)
+		p64, b64, p46, b46 := r.GetStats()
 		log.Printf("[RTPRelay] 释放: Call=%s, %s/%s, Port=%d, "+
 			"6→4: %d pkts/%d bytes, 4→6: %d pkts/%d bytes",
 			r.CallID, r.MediaType, r.Proto, r.LocalPort4,
-			r.Packets6to4, r.Bytes6to4,
-			r.Packets4to6, r.Bytes4to6)
+			p64, b64, p46, b46)
 	}
 
 	log.Printf("[RTPRelay] 通话结束释放: Call=%s, 共 %d 个中继", callID, len(relays))
 	return len(relays)
+}
+
+// GetStats 原子获取当前中继的收发包统计
+func (rs *RelaySession) GetStats() (pkts6to4, bytes6to4, pkts4to6, bytes4to6 uint64) {
+	return atomic.LoadUint64(&rs.Packets6to4),
+		atomic.LoadUint64(&rs.Bytes6to4),
+		atomic.LoadUint64(&rs.Packets4to6),
+		atomic.LoadUint64(&rs.Bytes4to6)
 }
 
 // Stats 返回统计信息

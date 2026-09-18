@@ -45,6 +45,13 @@ func NewTranslator(poolIPv4 net.IP, table *SessionTable) *Translator {
 	}
 }
 
+func (t *Translator) SetDebugLog(enabled bool) {
+	t.DebugLog = enabled
+	if t.ALG != nil {
+		t.ALG.SetDebugLog(enabled)
+	}
+}
+
 // Direction 标志包的翻译方向
 type Direction int
 

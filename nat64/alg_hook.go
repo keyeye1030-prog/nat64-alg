@@ -22,6 +22,7 @@ type ALGHandler struct {
 	sipTranslator  *sip.Translator
 	h323Translator *h323.Translator
 	relayManager   *rtp.RelayManager // RTP 媒体中继 (可选, 双臂模式下启用)
+	DebugLog       bool
 }
 
 // NewALGHandler 创建 ALG 处理器 (无 RTP 中继, 单臂模式)
@@ -37,6 +38,16 @@ func NewALGHandler(poolIPv4 net.IP) *ALGHandler {
 // SetRelayManager 注入 RTP 中继管理器 (双臂模式启用)
 func (a *ALGHandler) SetRelayManager(rm *rtp.RelayManager) {
 	a.relayManager = rm
+}
+
+func (a *ALGHandler) SetDebugLog(enabled bool) {
+	a.DebugLog = enabled
+}
+
+func (a *ALGHandler) debugf(format string, args ...any) {
+	if a.DebugLog {
+		log.Printf(format, args...)
+	}
 }
 
 // ALG 端口常量
@@ -129,7 +140,7 @@ func (a *ALGHandler) ProcessALG6to4(ipv4Pkt []byte, sess *Session) ([]byte, int)
 		if msgInfo.IsCallTermination() && a.relayManager != nil && msgInfo.CallID != "" {
 			released := a.relayManager.ReleaseByCallID(msgInfo.CallID)
 			if released > 0 {
-				log.Printf("[ALG-SIP] 检测到 %s, 释放 %d 个 RTP 中继 (Call-ID: %s)",
+				a.debugf("[ALG-SIP] 检测到 %s, 释放 %d 个 RTP 中继 (Call-ID: %s)",
 					msgInfo.Method, released, msgInfo.CallID)
 			}
 		}
@@ -153,6 +164,8 @@ func (a *ALGHandler) ProcessALG6to4(ipv4Pkt []byte, sess *Session) ([]byte, int)
 			modifiedPayload = result.ModifiedPayload
 			lengthDelta = result.LengthDelta
 		}
+		a.debugf("[ALG-SIP] 6→4 processed method=%s call_id=%s delta=%d media_ports=%d",
+			msgInfo.Method, msgInfo.CallID, lengthDelta, len(result.MediaPorts))
 
 	} else if isH323Port(srcPort, dstPort) {
 		// H.323 ALG
@@ -169,6 +182,7 @@ func (a *ALGHandler) ProcessALG6to4(ipv4Pkt []byte, sess *Session) ([]byte, int)
 			modifiedPayload = result.ModifiedPayload
 			lengthDelta = result.LengthDelta
 		}
+		a.debugf("[ALG-H323] 6→4 processed delta=%d media_ports=%d", lengthDelta, len(result.MediaPorts))
 	}
 
 	// 3. 如果载荷变化, 更新 Delta Tracker
@@ -276,7 +290,7 @@ func (a *ALGHandler) ProcessALG4to6(ipv6Pkt []byte, sess *Session) ([]byte, int)
 		if msgInfo.IsCallTermination() && a.relayManager != nil && msgInfo.CallID != "" {
 			released := a.relayManager.ReleaseByCallID(msgInfo.CallID)
 			if released > 0 {
-				log.Printf("[ALG-SIP] 4→6 检测到 %s, 释放 %d 个 RTP 中继 (Call-ID: %s)",
+				a.debugf("[ALG-SIP] 4→6 检测到 %s, 释放 %d 个 RTP 中继 (Call-ID: %s)",
 					msgInfo.Method, released, msgInfo.CallID)
 			}
 		}
@@ -288,6 +302,8 @@ func (a *ALGHandler) ProcessALG4to6(ipv6Pkt []byte, sess *Session) ([]byte, int)
 		}
 		modifiedPayload = result.ModifiedPayload
 		lengthDelta = result.LengthDelta
+		a.debugf("[ALG-SIP] 4→6 processed method=%s call_id=%s delta=%d",
+			msgInfo.Method, msgInfo.CallID, lengthDelta)
 	} else if isH323Port(srcPort, dstPort) {
 		result, err := a.h323Translator.ProcessH225Message(appPayload, clientIPv6, mappedClientIPv4, "4to6")
 		if err != nil {
@@ -296,6 +312,7 @@ func (a *ALGHandler) ProcessALG4to6(ipv6Pkt []byte, sess *Session) ([]byte, int)
 		}
 		modifiedPayload = result.ModifiedPayload
 		lengthDelta = result.LengthDelta
+		a.debugf("[ALG-H323] 4→6 processed delta=%d media_ports=%d", lengthDelta, len(result.MediaPorts))
 	}
 
 	// 3. 如果载荷变化, 更新 Delta Tracker
@@ -385,7 +402,7 @@ func (a *ALGHandler) allocateRelaysAndRewriteSDP(
 		newRtcp := "a=rtcp:" + strconv.Itoa(int(pair.RTCP.LocalPort4))
 		modifiedStr = replaceFirst(modifiedStr, oldRtcp, newRtcp)
 
-		log.Printf("[ALG-RTP] 已分配中继对: Call=%s, %s:%d ↔ %s:%d (RTP=%d, RTCP=%d)",
+		a.debugf("[ALG-RTP] 已分配中继对: Call=%s, %s:%d ↔ %s:%d (RTP=%d, RTCP=%d)",
 			callID, clientIPv6, mp.OriginalPort,
 			relayIPv4, mp.OriginalPort,
 			pair.RTP.LocalPort4, pair.RTCP.LocalPort4)
@@ -419,13 +436,13 @@ func (a *ALGHandler) allocateH323Relays(
 			pair, err := a.relayManager.AllocateRelayPair(callID, "audio", clientIPv6, mp.OriginalPort, remoteIPv4, mp.OriginalPort)
 			if err == nil {
 				relay = pair.RTP
-				log.Printf("[ALG-H323] 已分配 RTP 中继: %d", relay.LocalPort4)
+				a.debugf("[ALG-H323] 已分配 RTP 中继: %d", relay.LocalPort4)
 			}
 		} else {
 			// 对于 H.245 或其他单端口, 仅分配一个中继
 			relay, err = a.relayManager.AllocateRelay(callID, clientIPv6, mp.OriginalPort, remoteIPv4, mp.OriginalPort)
 			if err == nil {
-				log.Printf("[ALG-H323] 已分配 %s 中继: %d", mp.Purpose, relay.LocalPort4)
+				a.debugf("[ALG-H323] 已分配 %s 中继: %d", mp.Purpose, relay.LocalPort4)
 			}
 		}
 

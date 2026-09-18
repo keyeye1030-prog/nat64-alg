@@ -80,6 +80,7 @@ type DualNICConfig struct {
 	RTPPortEnd     uint16           // RTP 中继端口范围终点
 	SessionTTL     time.Duration
 	StaticMappings map[string]net.IP // 一对一静态 IP 映射表 (IPv6 -> IPv4)
+	DebugLog       bool
 }
 
 // NewDualNICEngine 创建双臂双网卡引擎
@@ -192,6 +193,7 @@ func NewDualNICEngine(config DualNICConfig) (*DualNICEngine, error) {
 		sessionTable.SetStaticMappings(config.StaticMappings)
 	}
 	translator := nat64.NewTranslator(config.PoolIPv4s[0], sessionTable)
+	translator.SetDebugLog(config.DebugLog)
 
 	// 配置二层 MAC 地址
 	translator.MAC.GatewayMAC4 = config.IPv4GatewayMAC
@@ -527,16 +529,24 @@ func (e *DualNICEngine) GetRelayManager() *rtp.RelayManager {
 	return e.relayManager
 }
 
-// sessionCleaner 定期清理过期的 NAT64 会话
+// sessionCleaner 定期清理过期的 NAT64 会话与二层邻居表
 func (e *DualNICEngine) sessionCleaner(table *nat64.SessionTable) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
 		cleaned := table.CleanExpired()
 		active, _ := e.relayManager.Stats()
-		if cleaned > 0 {
-			log.Printf("[SessionCleaner] 清除 %d 条过期会话, 剩余: %d, RTP 中继: %d",
-				cleaned, table.Stats(), active)
+
+		var cleanedNeighbors int
+		var remainingNeighbors int
+		if e.translator != nil && e.translator.MAC != nil && e.translator.MAC.Neighbors != nil {
+			cleanedNeighbors = e.translator.MAC.Neighbors.CleanExpired(5 * time.Minute)
+			remainingNeighbors = e.translator.MAC.Neighbors.Count()
+		}
+
+		if cleaned > 0 || cleanedNeighbors > 0 {
+			log.Printf("[SessionCleaner] 清除 %d 条过期会话(剩余 %d), 清除 %d 条过期邻居(剩余 %d), RTP 中继: %d",
+				cleaned, table.Stats(), cleanedNeighbors, remainingNeighbors, active)
 		}
 	}
 }

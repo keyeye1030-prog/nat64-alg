@@ -91,6 +91,69 @@ func (nt *NeighborTable) Lookup(ip net.IP) (net.HardwareAddr, bool) {
 	return entry.MAC, true
 }
 
+// CleanExpired 定期剔除超时的非静态动态学习邻居条目
+// 仅清理 !IsStatic 且 time.Since(LastSeen) > ttl 的条目，保护静态网关/节点不被清理
+func (nt *NeighborTable) CleanExpired(ttl time.Duration) int {
+	nt.mu.Lock()
+	defer nt.mu.Unlock()
+
+	cleaned := 0
+	cutoff := time.Now().Add(-ttl)
+
+	for ipStr, entry := range nt.entries {
+		if !entry.IsStatic && entry.LastSeen.Before(cutoff) {
+			delete(nt.entries, ipStr)
+			cleaned++
+		}
+	}
+	return cleaned
+}
+
+// Count 返回当前邻居表条目总数
+func (nt *NeighborTable) Count() int {
+	nt.mu.RLock()
+	defer nt.mu.RUnlock()
+	return len(nt.entries)
+}
+
+// Stats 返回邻居表的详细统计信息 (总数, 动态条目数, 静态条目数)
+func (nt *NeighborTable) Stats() (total int, dynamic int, static int) {
+	nt.mu.RLock()
+	defer nt.mu.RUnlock()
+
+	total = len(nt.entries)
+	for _, entry := range nt.entries {
+		if entry.IsStatic {
+			static++
+		} else {
+			dynamic++
+		}
+	}
+	return
+}
+
+// StartCleaner 启动独立的后台定时清理协程
+func (nt *NeighborTable) StartCleaner(interval, ttl time.Duration, stopCh <-chan struct{}) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				cleaned := nt.CleanExpired(ttl)
+				if cleaned > 0 {
+					total, dyn, st := nt.Stats()
+					log.Printf("[NeighborCleaner] 🧹 清除 %d 条过期邻居条目, 剩余: %d (动态: %d, 静态: %d)",
+						cleaned, total, dyn, st)
+				}
+			case <-stopCh:
+				return
+			}
+		}
+	}()
+}
+
 // MACConfig 保存引擎所需的二层地址配置
 type MACConfig struct {
 	// 本机网卡 MAC (从 net.Interface 自动获取)

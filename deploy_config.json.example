@@ -1,0 +1,33 @@
+{
+  "source_archive": "nat64-src.tar.gz",
+  "remote_workdir": "/home/example/nat64-alg",
+  "remote_archive": "/home/example/nat64-src.tar.gz",
+  "remote_service_tmp": "/home/example/nat64-alg.service",
+  "service_name": "nat64-alg",
+  "go_proxy": "https://goproxy.cn,direct",
+  "bpf_include": "/usr/include/x86_64-linux-gnu",
+  "ipv6_gateway_mac": "00:11:22:33:44:66",
+  "config": {
+    "mode": "dual",
+    "pool_ipv4s": ["198.51.100.1"],
+    "nat64_prefix": "64:ff9b::/96",
+    "iface_ipv6": "eth0",
+    "iface_ipv4": "eth1",
+    "gw_ipv6": "2001:db8::2",
+    "ipv6_gateway": "2001:db8::1",
+    "ipv4_gateway_mac": "00:11:22:33:44:55",
+    "enable_arp_proxy": false,
+    "rtp_port_start": 20000,
+    "rtp_port_end": 30000,
+    "static_mappings": {
+      "2001:db8::10": "198.51.100.10"
+    },
+    "preflight_enabled": true,
+    "preflight_min_speed_mbps": 1000,
+    "preflight_queues": 1,
+    "preflight_require_offloads_off": true,
+    "preflight_require_carrier": true,
+    "preflight_require_full_duplex": true,
+    "alg_debug": false
+  }
+}

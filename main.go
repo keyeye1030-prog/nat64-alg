@@ -28,6 +28,7 @@ type Config struct {
 	RTPPortStart   uint              `json:"rtp_port_start"`
 	RTPPortEnd     uint              `json:"rtp_port_end"`
 	StaticMaps     map[string]string `json:"static_mappings"`
+	ALGDebug       bool              `json:"alg_debug"`
 
 	PreflightEnabled            bool `json:"preflight_enabled"`
 	PreflightMinSpeedMbps       int  `json:"preflight_min_speed_mbps"`
@@ -54,6 +55,7 @@ func main() {
 	preflightEnabled := flag.Bool("preflight", true, "Run physical NIC preflight checks before starting")
 	preflightMinSpeed := flag.Int("preflight-min-speed-mbps", 100, "Minimum negotiated NIC speed in Mb/s")
 	preflightQueues := flag.Int("preflight-queues", 1, "Required current combined queue count")
+	algDebug := flag.Bool("alg-debug", false, "Enable ALG summary debug logs")
 
 	flag.Parse()
 
@@ -70,6 +72,7 @@ func main() {
 		PreflightEnabled:            *preflightEnabled,
 		PreflightMinSpeedMbps:       *preflightMinSpeed,
 		PreflightQueues:             *preflightQueues,
+		ALGDebug:                    *algDebug,
 		PreflightRequireOffloadsOff: true,
 		PreflightRequireCarrier:     true,
 		PreflightRequireFullDuplex:  true,
@@ -124,7 +127,7 @@ func main() {
 	switch cfg.Mode {
 	case "single":
 		runPreflightOrExit(cfg, []string{cfg.Interface})
-		startSingleMode(cfg.Interface, poolIPv4s)
+		startSingleMode(cfg, poolIPv4s)
 	case "dual":
 		runPreflightOrExit(cfg, []string{cfg.IfaceIPv6, cfg.IfaceIPv4})
 		startDualMode(cfg, poolIPv4s)
@@ -150,14 +153,15 @@ func runPreflightOrExit(cfg Config, interfaces []string) {
 	}
 }
 
-func startSingleMode(ifaceName string, poolIPv4s []net.IP) {
-	log.Printf("  Interface: %s", ifaceName)
+func startSingleMode(cfg Config, poolIPv4s []net.IP) {
+	log.Printf("  Interface: %s", cfg.Interface)
 
-	xdpEngine, err := engine.NewXDPEngine(ifaceName, poolIPv4s[0])
+	xdpEngine, err := engine.NewXDPEngine(cfg.Interface, poolIPv4s[0])
 	if err != nil {
 		log.Fatalf("Failed to init XDP engine: %v", err)
 	}
 	defer xdpEngine.Close()
+	xdpEngine.GetTranslator().SetDebugLog(cfg.ALGDebug)
 
 	go xdpEngine.Start()
 	waitForShutdown()
@@ -235,6 +239,7 @@ func startDualMode(cfg Config, poolIPv4s []net.IP) {
 		RTPPortStart:   uint16(cfg.RTPPortStart),
 		RTPPortEnd:     uint16(cfg.RTPPortEnd),
 		StaticMappings: staticIPs,
+		DebugLog:       cfg.ALGDebug,
 	}
 
 	dualEngine, err := engine.NewDualNICEngine(config)

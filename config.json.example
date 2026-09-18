@@ -12,5 +12,6 @@
   "preflight_queues": 1,
   "preflight_require_offloads_off": true,
   "preflight_require_carrier": true,
-  "preflight_require_full_duplex": true
+  "preflight_require_full_duplex": true,
+  "alg_debug": false
 }

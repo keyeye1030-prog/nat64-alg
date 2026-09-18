@@ -250,9 +250,9 @@ func TestRelaySession_Forwarding(t *testing.T) {
 	}
 
 	// 验证统计
+	p64, b64, p46, b46 := pair.RTP.GetStats()
 	t.Logf("  RTP 转发统计: 6→4=%d pkts/%d bytes, 4→6=%d pkts/%d bytes",
-		pair.RTP.Packets6to4, pair.RTP.Bytes6to4,
-		pair.RTP.Packets4to6, pair.RTP.Bytes4to6)
+		p64, b64, p46, b46)
 }
 
 func TestRelayManager_PortExhaustion(t *testing.T) {
