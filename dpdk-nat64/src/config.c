@@ -1077,7 +1077,25 @@ int nat64_build_eal_args(const struct nat64_config *cfg, char ***argv_out, int *
     }
 
     if (cfg->sys.mem_mb > 0) {
-        snprintf(buf, sizeof(buf), "%u", cfg->sys.mem_mb);
+        uint32_t mem_mb = cfg->sys.mem_mb;
+        FILE *hp_f = fopen("/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages", "r");
+        if (hp_f == NULL) {
+            hp_f = fopen("/sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages", "r");
+        }
+        if (hp_f != NULL) {
+            unsigned int nr = 0;
+            if (fscanf(hp_f, "%u", &nr) == 1 && nr > 0) {
+                uint32_t max_hp_mb = (uint32_t) nr * 1024;
+                if (mem_mb > max_hp_mb) {
+                    fprintf(stderr,
+                            "warning: configured mem %u MB exceeds available 1GB hugepages (%u MB), capping to %u MB\n",
+                            mem_mb, max_hp_mb, max_hp_mb);
+                    mem_mb = max_hp_mb;
+                }
+            }
+            fclose(hp_f);
+        }
+        snprintf(buf, sizeof(buf), "%u", mem_mb);
         argv[argc++] = xstrdup("--socket-mem");
         argv[argc++] = xstrdup(buf);
     }
