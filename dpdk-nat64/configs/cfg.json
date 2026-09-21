@@ -40,6 +40,7 @@
   "route_file": "/opt/dpdk-nat64/etc/remote-routes.json",
   "ipvs": [
     {
+      "dst_mode": "embed_v4",
       "vs": {
         "name": "vs1",
         "proto": "any",
@@ -48,6 +49,10 @@
         "vaddr": [
           {
             "addr": "240b:8104:088e:fffa::",
+            "mask": "96"
+          },
+          {
+            "addr": "240b:8104:088e:fffb::",
             "mask": "96"
           }
         ],

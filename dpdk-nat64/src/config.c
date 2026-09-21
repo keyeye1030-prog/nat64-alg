@@ -882,6 +882,11 @@ static int parse_services(const char *json, const jsmntok_t *tokens, int idx, st
         if (tok_idx >= 0 && token_to_cstr(json, &tokens[tok_idx], svc->vs.mode, sizeof(svc->vs.mode)) < 0) {
             return -EINVAL;
         }
+        if (dst_mode_idx < 0) {
+            if (strcmp(svc->vs.mode, "64") == 0 || strcmp(svc->vs.mode, "nat64") == 0) {
+                svc->dst_mode = NAT64_DST_EMBED_V4;
+            }
+        }
         tok_idx = object_get(json, tokens, vs_idx, "sched");
         if (tok_idx >= 0 && token_to_cstr(json, &tokens[tok_idx], svc->vs.sched, sizeof(svc->vs.sched)) < 0) {
             return -EINVAL;
